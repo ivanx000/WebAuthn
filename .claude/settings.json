@@ -1,0 +1,44 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/scripts/log-command.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/scripts/build-clippy.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/scripts/docs-sync.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/scripts/test-runner.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/scripts/auto-commit.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

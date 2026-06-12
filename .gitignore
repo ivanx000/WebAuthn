@@ -1,2 +1,13 @@
+# Rust build artefacts
 /target
-Cargo.lock
+
+# Environment / secrets
+.env
+.env.*
+
+# Claude Code session logs — never commit command history
+.claude/logs/
+
+# Cargo.lock is intentionally committed because this repo contains a binary
+# example (examples/demo.rs). Libraries typically omit it; binaries keep it.
+# See: https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
