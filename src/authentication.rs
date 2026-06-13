@@ -1,83 +1,100 @@
-//! Authentication ceremony (W3C WebAuthn §7.2).
+//! Authentication ceremony — W3C WebAuthn §7.2.
 //!
 //! The authentication ceremony is how a user proves possession of a previously
-//! registered credential. The relying party's job is to:
+//! registered credential. The relying party's job:
 //!
-//! 1. Verify that the response was produced for *this* challenge and *this* origin.
-//! 2. Verify that the authenticator data is bound to *this* RP ID.
+//! 1. Verify the response was produced for *this* challenge and *this* origin.
+//! 2. Verify the authenticator data is bound to *this* RP ID.
 //! 3. Verify the ECDSA signature over `authData || SHA-256(clientDataJSON)`.
 //! 4. Check the sign count to detect cloned authenticators.
-
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+//!
+//! Spec: https://www.w3.org/TR/webauthn-2/#sctn-verifying-assertion
 
 use crate::authenticator_data;
+use crate::challenge::CHALLENGE_MAX_AGE_SECS;
 use crate::client_data;
-use crate::credential::{AuthenticationResult, Credential, PublicKey};
-use crate::crypto::{sha256, verify_es256_signature};
+use crate::credential::{AuthenticationResult, Challenge, Credential, PublicKey};
+use crate::crypto::{sha256, verify_es256};
 use crate::error::{PassforgeError, Result};
-use crate::{AuthenticatorAssertionResponse, Challenge};
+use crate::registration::RelyingParty;
 
-/// Verify an authentication response against a stored credential.
+/// The browser's response after a `navigator.credentials.get()` call.
 ///
-/// Call this after the client returns an `AuthenticatorAssertionResponse`.
-/// If it returns `Ok`, update the stored credential's `sign_count` to
-/// `result.new_sign_count` and accept the authentication.
-///
-/// # Arguments
-/// * `stored_credential` — The credential looked up by credential ID from your database.
-/// * `expected_origin`   — The exact origin of your app, e.g. `"https://example.com"`.
-/// * `challenge`         — The challenge you previously issued for this ceremony.
-/// * `response`          — The `AuthenticatorAssertionResponse` from the client.
-///
-/// # Spec reference
-/// W3C WebAuthn §7.2 "Verifying an Authentication Assertion"
-pub fn verify(
+/// All fields carry **raw decoded bytes** — base64url decoding must happen
+/// outside the library before constructing this struct.
+#[derive(Debug, Clone)]
+pub struct AuthenticatorAssertionResponse {
+    /// Raw UTF-8 bytes of the `clientDataJSON` object.
+    pub client_data_json: Vec<u8>,
+
+    /// Raw bytes of the `authenticatorData` structure.
+    pub authenticator_data: Vec<u8>,
+
+    /// DER-encoded ECDSA signature bytes.
+    pub signature: Vec<u8>,
+
+    /// Optional raw user handle bytes (some authenticators omit it).
+    pub user_handle: Option<Vec<u8>>,
+}
+
+impl RelyingParty {
+    /// Verify an authentication ceremony response (W3C WebAuthn §7.2).
+    ///
+    /// Call this after the client returns an `AuthenticatorAssertionResponse`.
+    /// On `Ok`, update the stored credential's `sign_count` to
+    /// `result.new_sign_count` before responding to the client.
+    ///
+    /// # Arguments
+    /// * `stored_credential` — Retrieved from your database by credential ID.
+    /// * `challenge`         — The challenge you issued for this ceremony.
+    /// * `response`          — The assertion response from the authenticator.
+    ///
+    /// # Errors
+    /// Returns a [`PassforgeError`] variant indicating exactly which
+    /// verification step failed, including `SignCountInvalid` for suspected
+    /// authenticator clones.
+    pub fn verify_authentication(
+        &self,
+        stored_credential: &Credential,
+        challenge: &Challenge,
+        response: &AuthenticatorAssertionResponse,
+    ) -> Result<AuthenticationResult> {
+        verify_authentication_inner(self, stored_credential, challenge, response)
+    }
+}
+
+// ─── Ceremony implementation ──────────────────────────────────────────────────
+
+fn verify_authentication_inner(
+    rp: &RelyingParty,
     stored_credential: &Credential,
-    expected_origin: &str,
     challenge: &Challenge,
     response: &AuthenticatorAssertionResponse,
 ) -> Result<AuthenticationResult> {
+    // ── Pre-check: challenge expiry ───────────────────────────────────────────
+    if challenge.is_expired(CHALLENGE_MAX_AGE_SECS) {
+        return Err(PassforgeError::ChallengeExpired);
+    }
+
     // ── §7.2 step 11 ─────────────────────────────────────────────────────────
-    // Parse clientDataJSON: base64url-decode, then parse JSON.
-    let (client_data, client_data_json_bytes) = client_data::parse(&response.client_data_json)?;
+    // Parse clientDataJSON bytes (already raw UTF-8).
+    let parsed_cd = client_data::parse_client_data(&response.client_data_json)?;
 
     // ── §7.2 step 13 ─────────────────────────────────────────────────────────
-    // Verify the type is "webauthn.get".
-    if client_data.type_ != "webauthn.get" {
-        return Err(PassforgeError::InvalidClientData(format!(
-            "expected type \"webauthn.get\", got \"{}\"",
-            client_data.type_
-        )));
-    }
-
+    // Verify type == "webauthn.get".
     // ── §7.2 step 14 ─────────────────────────────────────────────────────────
-    // Verify the challenge matches the one the relying party issued.
-    if client_data.challenge != challenge.bytes {
-        return Err(PassforgeError::ChallengeMismatch);
-    }
-
+    // Verify the challenge matches.
     // ── §7.2 step 15 ─────────────────────────────────────────────────────────
-    // Verify the origin matches exactly.
-    if client_data.origin != expected_origin {
-        return Err(PassforgeError::OriginMismatch);
-    }
+    // Verify the origin matches rp.origin.
+    client_data::validate_client_data(&parsed_cd, "webauthn.get", &challenge.bytes, &rp.origin)?;
 
     // ── §7.2 step 17 ─────────────────────────────────────────────────────────
-    // Hash clientDataJSON with SHA-256. This is the clientDataHash that was
-    // included in the signed payload.
-    let client_data_hash = sha256(&client_data_json_bytes);
+    // Let hash be SHA-256(clientDataJSON bytes).
+    let client_data_hash = sha256(&parsed_cd.raw_json);
 
     // ── §7.2 step 18 ─────────────────────────────────────────────────────────
-    // Decode the authenticator data: base64url → raw bytes.
-    let auth_data_bytes = URL_SAFE_NO_PAD
-        .decode(&response.authenticator_data)
-        .map_err(|e| {
-            PassforgeError::Base64DecodeError(format!("authenticatorData: {e}"))
-        })?;
-
-    // ── §7.2 step 18 (continued) ──────────────────────────────────────────────
     // Parse the authenticator data binary structure.
-    let auth_data = authenticator_data::parse(&auth_data_bytes)?;
+    let auth_data = authenticator_data::parse_authenticator_data(&response.authenticator_data)?;
 
     // ── §7.2 step 19 ─────────────────────────────────────────────────────────
     // Verify rpIdHash = SHA-256(stored credential's rp_id).
@@ -93,53 +110,44 @@ pub fn verify(
     }
 
     // ── §7.2 step 21 ─────────────────────────────────────────────────────────
-    // (UV check is optional in this library — the caller decides whether to require it.)
-
-    // ── §7.2 step 23 ─────────────────────────────────────────────────────────
-    // Decode the raw signature bytes.
-    let signature_bytes = URL_SAFE_NO_PAD
-        .decode(&response.signature)
-        .map_err(|e| PassforgeError::Base64DecodeError(format!("signature: {e}")))?;
+    // UV check is optional in this library — the caller decides whether to
+    // require user verification for their threat model.
 
     // ── §7.2 step 24 ─────────────────────────────────────────────────────────
     // Verify the signature over: authData || SHA-256(clientDataJSON).
     //
-    // Note on double hashing: ES256 is ECDSA-P256-SHA256, meaning the signing
-    // algorithm hashes the message itself. The message to sign is:
-    //   authData_bytes || SHA-256(clientDataJSON_bytes)
-    // ring hashes *that* message internally, so we do NOT pre-hash it.
-    let mut signed_data = auth_data_bytes.clone();
+    // ES256 is ECDSA-P256-SHA256: ring hashes the *message* internally.
+    // The message is `authData_bytes || clientDataHash` (not pre-hashed again).
+    let mut signed_data = auth_data.raw.clone();
     signed_data.extend_from_slice(&client_data_hash);
 
-    let verified = match &stored_credential.public_key {
-        PublicKey::ES256(pk_bytes) => {
-            verify_es256_signature(pk_bytes, &signed_data, &signature_bytes)
+    match &stored_credential.public_key {
+        PublicKey::ES256 { x, y } => {
+            // Reconstruct the 65-byte uncompressed point ring expects.
+            let mut pk = Vec::with_capacity(65);
+            pk.push(0x04);
+            pk.extend_from_slice(x);
+            pk.extend_from_slice(y);
+            verify_es256(&pk, &signed_data, &response.signature)?;
         }
         PublicKey::RS256(_) => {
             return Err(PassforgeError::InvalidPublicKey(
                 "RS256 signature verification is not yet implemented".to_string(),
             ))
         }
-    };
-
-    if !verified {
-        return Err(PassforgeError::SignatureVerificationFailed);
     }
 
     // ── §7.2 step 25 ─────────────────────────────────────────────────────────
     // Verify the sign count is strictly greater than the stored value.
     //
-    // A sign count of 0 from the authenticator means it doesn't support
-    // counting; in that case we accept the assertion but cannot detect clones.
-    // A non-zero received count that is <= stored indicates a possible clone.
+    // A received count of 0 means the authenticator does not support counters;
+    // we accept but cannot detect clones. A non-zero received count ≤ stored
+    // count indicates a possible clone or replay.
     let received = auth_data.sign_count;
     let stored = stored_credential.sign_count;
 
     if received != 0 && received <= stored {
-        return Err(PassforgeError::SignCountInvalid {
-            stored,
-            received,
-        });
+        return Err(PassforgeError::SignCountInvalid { stored, received });
     }
 
     Ok(AuthenticationResult {

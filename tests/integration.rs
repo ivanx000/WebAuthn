@@ -3,22 +3,16 @@
 //! These tests simulate both the authenticator (key generation, signing) and the
 //! relying party (passforge library) to exercise the complete ceremony flows.
 //!
-//! ## On test vectors
-//!
-//! The credential data here is generated programmatically using real cryptographic
-//! primitives (ring's P-256 ECDSA). This is equivalent to using browser-captured
-//! vectors in terms of cryptographic correctness — the paths through the code are
-//! identical. The values are not hardcoded because they depend on keys generated
-//! fresh per test run; see `make_test_fixture` for the generation logic.
+//! All wire-type fields use raw bytes (not base64url), matching the updated API
+//! where base64url decoding is the caller's responsibility.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ciborium::value::Value;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
 use passforge::{
-    generate_challenge, AuthenticatorAssertionResponse, AuthenticatorAttestationResponse,
-    PassforgeError, RelyingParty,
+    AuthenticatorAssertionResponse, AuthenticatorAttestationResponse, Challenge, PassforgeError,
+    RelyingParty,
 };
 
 // ─── Shared constants ─────────────────────────────────────────────────────────
@@ -26,14 +20,13 @@ use passforge::{
 const RP_ID: &str = "example.com";
 const ORIGIN: &str = "https://example.com";
 
-// ─── Test fixture builder ─────────────────────────────────────────────────────
+// ─── Test fixture ─────────────────────────────────────────────────────────────
 
-/// Everything needed to run a ceremony pair.
 struct Fixture {
     rng: SystemRandom,
     key_pair: EcdsaKeyPair,
     cred_id: Vec<u8>,
-    public_key_bytes: Vec<u8>,
+    public_key_bytes: Vec<u8>, // 65-byte uncompressed point
 }
 
 impl Fixture {
@@ -44,11 +37,10 @@ impl Fixture {
             EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
                 .unwrap();
         let public_key_bytes = key_pair.public_key().as_ref().to_vec();
-        let cred_id = vec![0xAB; 16];
         Self {
             rng,
             key_pair,
-            cred_id,
+            cred_id: vec![0xABu8; 16],
             public_key_bytes,
         }
     }
@@ -63,9 +55,8 @@ impl Fixture {
         sign_count: u32,
         fmt: &str,
     ) -> AuthenticatorAttestationResponse {
-        let client_data_json = make_client_data_json(type_str, challenge, origin);
-        let client_data_json_b64 = URL_SAFE_NO_PAD.encode(client_data_json.as_bytes());
-
+        let client_data_json =
+            make_client_data_json_bytes(type_str, challenge, origin);
         let auth_data = make_authenticator_data(
             rp_id,
             flags,
@@ -75,8 +66,8 @@ impl Fixture {
         let att_obj = make_attestation_object(&auth_data, fmt);
 
         AuthenticatorAttestationResponse {
-            client_data_json: client_data_json_b64,
-            attestation_object: URL_SAFE_NO_PAD.encode(&att_obj),
+            client_data_json,
+            attestation_object: att_obj,
         }
     }
 
@@ -87,37 +78,33 @@ impl Fixture {
         rp_id: &str,
         sign_count: u32,
     ) -> AuthenticatorAssertionResponse {
-        let client_data_str = make_client_data_json("webauthn.get", challenge, origin);
-        let client_data_b64 = URL_SAFE_NO_PAD.encode(client_data_str.as_bytes());
-
+        let client_data_bytes = make_client_data_json_bytes("webauthn.get", challenge, origin);
         let auth_data = make_authenticator_data(rp_id, 0x01, sign_count, None);
-        let auth_data_b64 = URL_SAFE_NO_PAD.encode(&auth_data);
 
-        let client_data_hash = passforge::crypto::sha256(client_data_str.as_bytes());
+        let client_data_hash = passforge::crypto::sha256(&client_data_bytes);
         let mut signed_data = auth_data.clone();
         signed_data.extend_from_slice(&client_data_hash);
 
         let sig = self.key_pair.sign(&self.rng, &signed_data).unwrap();
-        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_ref());
 
         AuthenticatorAssertionResponse {
-            client_data_json: client_data_b64,
-            authenticator_data: auth_data_b64,
-            signature: sig_b64,
+            client_data_json: client_data_bytes,
+            authenticator_data: auth_data,
+            signature: sig.as_ref().to_vec(),
             user_handle: None,
         }
     }
 }
 
-// ─── Happy-path integration tests ─────────────────────────────────────────────
+// ─── Happy-path tests ─────────────────────────────────────────────────────────
 
 #[test]
 fn full_registration_and_authentication_flow() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
 
     // Registration
-    let reg_challenge = generate_challenge().unwrap();
+    let reg_challenge = Challenge::new().unwrap();
     let response = fixture.make_registration_response(
         &reg_challenge.bytes,
         "webauthn.create",
@@ -128,7 +115,7 @@ fn full_registration_and_authentication_flow() {
         "none",
     );
     let reg_result = rp
-        .verify_registration(RP_ID, ORIGIN, &reg_challenge, &response, b"uid".to_vec())
+        .verify_registration(&reg_challenge, &response, b"uid")
         .expect("registration should succeed");
 
     assert_eq!(reg_result.credential.sign_count, 1);
@@ -140,25 +127,25 @@ fn full_registration_and_authentication_flow() {
 
     // Authentication
     let mut credential = reg_result.credential;
-    let auth_challenge = generate_challenge().unwrap();
+    let auth_challenge = Challenge::new().unwrap();
     let auth_response = fixture.make_auth_response(&auth_challenge.bytes, ORIGIN, RP_ID, 2);
 
     let auth_result = rp
-        .verify_authentication(&credential, ORIGIN, &auth_challenge, &auth_response)
+        .verify_authentication(&credential, &auth_challenge, &auth_response)
         .expect("authentication should succeed");
 
     assert_eq!(auth_result.new_sign_count, 2);
-    assert!(!auth_result.user_verified); // UV was not set in flags
+    assert!(!auth_result.user_verified);
     credential.sign_count = auth_result.new_sign_count;
     assert_eq!(credential.sign_count, 2);
 }
 
 #[test]
 fn authentication_with_uv_flag() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
 
-    let reg_challenge = generate_challenge().unwrap();
+    let reg_challenge = Challenge::new().unwrap();
     let response = fixture.make_registration_response(
         &reg_challenge.bytes,
         "webauthn.create",
@@ -169,39 +156,39 @@ fn authentication_with_uv_flag() {
         "none",
     );
     let credential = rp
-        .verify_registration(RP_ID, ORIGIN, &reg_challenge, &response, b"uid".to_vec())
+        .verify_registration(&reg_challenge, &response, b"uid")
         .unwrap()
         .credential;
 
-    let auth_challenge = generate_challenge().unwrap();
-    // Build an assertion with UV flag set
-    let client_data_str = make_client_data_json("webauthn.get", &auth_challenge.bytes, ORIGIN);
+    let auth_challenge = Challenge::new().unwrap();
+    let client_data_bytes =
+        make_client_data_json_bytes("webauthn.get", &auth_challenge.bytes, ORIGIN);
     let auth_data = make_authenticator_data(RP_ID, 0x05, 1, None); // UP + UV
-    let client_data_hash = passforge::crypto::sha256(client_data_str.as_bytes());
+    let client_data_hash = passforge::crypto::sha256(&client_data_bytes);
     let mut signed_data = auth_data.clone();
     signed_data.extend_from_slice(&client_data_hash);
     let sig = fixture.key_pair.sign(&fixture.rng, &signed_data).unwrap();
 
     let auth_response = AuthenticatorAssertionResponse {
-        client_data_json: URL_SAFE_NO_PAD.encode(client_data_str.as_bytes()),
-        authenticator_data: URL_SAFE_NO_PAD.encode(&auth_data),
-        signature: URL_SAFE_NO_PAD.encode(sig.as_ref()),
+        client_data_json: client_data_bytes,
+        authenticator_data: auth_data,
+        signature: sig.as_ref().to_vec(),
         user_handle: None,
     };
 
     let result = rp
-        .verify_authentication(&credential, ORIGIN, &auth_challenge, &auth_response)
+        .verify_authentication(&credential, &auth_challenge, &auth_response)
         .unwrap();
     assert!(result.user_verified);
 }
 
-// ─── Error case tests — every PassforgeError variant ─────────────────────────
+// ─── Error cases — every PassforgeError variant ───────────────────────────────
 
 #[test]
 fn rejects_wrong_type_in_registration() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
-    let challenge = generate_challenge().unwrap();
+    let challenge = Challenge::new().unwrap();
     let response = fixture.make_registration_response(
         &challenge.bytes,
         "webauthn.get", // wrong type
@@ -212,21 +199,19 @@ fn rejects_wrong_type_in_registration() {
         "none",
     );
     let err = rp
-        .verify_registration(RP_ID, ORIGIN, &challenge, &response, vec![])
+        .verify_registration(&challenge, &response, &[])
         .unwrap_err();
     assert!(matches!(err, PassforgeError::InvalidClientData(_)));
 }
 
 #[test]
 fn rejects_challenge_mismatch_on_registration() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
-    let challenge = generate_challenge().unwrap();
-    let wrong_challenge = generate_challenge().unwrap();
-
-    // Response is built for `wrong_challenge`, but we verify against `challenge`
+    let challenge = Challenge::new().unwrap();
+    let wrong_challenge = Challenge::new().unwrap();
     let response = fixture.make_registration_response(
-        &wrong_challenge.bytes,
+        &wrong_challenge.bytes, // response contains wrong challenge
         "webauthn.create",
         ORIGIN,
         RP_ID,
@@ -235,16 +220,16 @@ fn rejects_challenge_mismatch_on_registration() {
         "none",
     );
     let err = rp
-        .verify_registration(RP_ID, ORIGIN, &challenge, &response, vec![])
+        .verify_registration(&challenge, &response, &[])
         .unwrap_err();
     assert!(matches!(err, PassforgeError::ChallengeMismatch));
 }
 
 #[test]
 fn rejects_origin_mismatch_on_registration() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
-    let challenge = generate_challenge().unwrap();
+    let challenge = Challenge::new().unwrap();
     let response = fixture.make_registration_response(
         &challenge.bytes,
         "webauthn.create",
@@ -255,37 +240,40 @@ fn rejects_origin_mismatch_on_registration() {
         "none",
     );
     let err = rp
-        .verify_registration(RP_ID, ORIGIN, &challenge, &response, vec![])
+        .verify_registration(&challenge, &response, &[])
         .unwrap_err();
-    assert!(matches!(err, PassforgeError::OriginMismatch));
+    assert!(matches!(
+        err,
+        PassforgeError::OriginMismatch { expected, got }
+        if expected == ORIGIN && got == "https://evil.com"
+    ));
 }
 
 #[test]
 fn rejects_rp_id_hash_mismatch_on_registration() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
-    let challenge = generate_challenge().unwrap();
-    // authenticatorData is built for a DIFFERENT rp_id
+    let challenge = Challenge::new().unwrap();
     let response = fixture.make_registration_response(
         &challenge.bytes,
         "webauthn.create",
         ORIGIN,
-        "evil.com", // wrong RP ID used to build auth data
+        "evil.com", // wrong RP ID used to build authenticator data
         0x41,
         1,
         "none",
     );
     let err = rp
-        .verify_registration(RP_ID, ORIGIN, &challenge, &response, vec![])
+        .verify_registration(&challenge, &response, &[])
         .unwrap_err();
     assert!(matches!(err, PassforgeError::RpIdHashMismatch));
 }
 
 #[test]
 fn rejects_missing_user_present_flag() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
-    let challenge = generate_challenge().unwrap();
+    let challenge = Challenge::new().unwrap();
     let response = fixture.make_registration_response(
         &challenge.bytes,
         "webauthn.create",
@@ -296,16 +284,16 @@ fn rejects_missing_user_present_flag() {
         "none",
     );
     let err = rp
-        .verify_registration(RP_ID, ORIGIN, &challenge, &response, vec![])
+        .verify_registration(&challenge, &response, &[])
         .unwrap_err();
     assert!(matches!(err, PassforgeError::UserNotPresent));
 }
 
 #[test]
 fn rejects_unsupported_attestation_format() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
-    let challenge = generate_challenge().unwrap();
+    let challenge = Challenge::new().unwrap();
     let response = fixture.make_registration_response(
         &challenge.bytes,
         "webauthn.create",
@@ -316,7 +304,7 @@ fn rejects_unsupported_attestation_format() {
         "packed", // not supported
     );
     let err = rp
-        .verify_registration(RP_ID, ORIGIN, &challenge, &response, vec![])
+        .verify_registration(&challenge, &response, &[])
         .unwrap_err();
     assert!(matches!(
         err,
@@ -326,123 +314,144 @@ fn rejects_unsupported_attestation_format() {
 
 #[test]
 fn rejects_invalid_client_data_json() {
-    let rp = RelyingParty::new();
-    let challenge = generate_challenge().unwrap();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
+    let challenge = Challenge::new().unwrap();
     let response = AuthenticatorAttestationResponse {
-        client_data_json: URL_SAFE_NO_PAD.encode(b"not json at all"),
-        attestation_object: String::new(),
+        client_data_json: b"not json at all".to_vec(),
+        attestation_object: vec![],
     };
     let err = rp
-        .verify_registration(RP_ID, ORIGIN, &challenge, &response, vec![])
+        .verify_registration(&challenge, &response, &[])
         .unwrap_err();
     assert!(matches!(err, PassforgeError::InvalidClientData(_)));
 }
 
 #[test]
 fn rejects_invalid_attestation_object_cbor() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
-    let challenge = generate_challenge().unwrap();
+    let challenge = Challenge::new().unwrap();
 
-    let client_data_json = make_client_data_json("webauthn.create", &challenge.bytes, ORIGIN);
-    // 0xFF is a CBOR break code — invalid at the start of a data item.
-    let response = AuthenticatorAttestationResponse {
-        client_data_json: URL_SAFE_NO_PAD.encode(client_data_json.as_bytes()),
-        attestation_object: URL_SAFE_NO_PAD.encode(&[0xFF_u8, 0x00, 0x00]),
-    };
+    let client_data_json = make_client_data_json_bytes("webauthn.create", &challenge.bytes, ORIGIN);
     let _ = fixture;
+    let response = AuthenticatorAttestationResponse {
+        client_data_json,
+        attestation_object: vec![0xFF, 0x00, 0x00], // invalid CBOR
+    };
     let err = rp
-        .verify_registration(RP_ID, ORIGIN, &challenge, &response, vec![])
+        .verify_registration(&challenge, &response, &[])
         .unwrap_err();
     assert!(matches!(err, PassforgeError::CborDecodeError(_)));
 }
 
 #[test]
-fn rejects_challenge_mismatch_on_authentication() {
-    let rp = RelyingParty::new();
+fn rejects_expired_challenge() {
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
 
+    // Create a challenge backdated to the past (well beyond the 5 min TTL).
+    let expired_challenge = Challenge {
+        bytes: vec![0u8; 32],
+        created_at: std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .unwrap(),
+    };
+
+    let response = fixture.make_registration_response(
+        &expired_challenge.bytes,
+        "webauthn.create",
+        ORIGIN,
+        RP_ID,
+        0x41,
+        1,
+        "none",
+    );
+    let err = rp
+        .verify_registration(&expired_challenge, &response, &[])
+        .unwrap_err();
+    assert!(matches!(err, PassforgeError::ChallengeExpired));
+}
+
+#[test]
+fn rejects_challenge_mismatch_on_authentication() {
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
+    let fixture = Fixture::new();
     let credential = register_credential(&rp, &fixture);
 
-    let real_challenge = generate_challenge().unwrap();
-    let wrong_challenge = generate_challenge().unwrap();
+    let real_challenge = Challenge::new().unwrap();
+    let wrong_challenge = Challenge::new().unwrap();
     let response = fixture.make_auth_response(&wrong_challenge.bytes, ORIGIN, RP_ID, 2);
 
     let err = rp
-        .verify_authentication(&credential, ORIGIN, &real_challenge, &response)
+        .verify_authentication(&credential, &real_challenge, &response)
         .unwrap_err();
     assert!(matches!(err, PassforgeError::ChallengeMismatch));
 }
 
 #[test]
 fn rejects_origin_mismatch_on_authentication() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
     let credential = register_credential(&rp, &fixture);
 
-    let challenge = generate_challenge().unwrap();
+    let challenge = Challenge::new().unwrap();
     let response = fixture.make_auth_response(&challenge.bytes, "https://phishing.com", RP_ID, 2);
 
     let err = rp
-        .verify_authentication(&credential, ORIGIN, &challenge, &response)
+        .verify_authentication(&credential, &challenge, &response)
         .unwrap_err();
-    assert!(matches!(err, PassforgeError::OriginMismatch));
+    assert!(matches!(err, PassforgeError::OriginMismatch { .. }));
 }
 
 #[test]
 fn rejects_rp_id_hash_mismatch_on_authentication() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
     let credential = register_credential(&rp, &fixture);
 
-    let challenge = generate_challenge().unwrap();
-    // Build authData bound to a different RP ID
+    let challenge = Challenge::new().unwrap();
     let response = fixture.make_auth_response(&challenge.bytes, ORIGIN, "evil.com", 2);
 
     let err = rp
-        .verify_authentication(&credential, ORIGIN, &challenge, &response)
+        .verify_authentication(&credential, &challenge, &response)
         .unwrap_err();
     assert!(matches!(err, PassforgeError::RpIdHashMismatch));
 }
 
 #[test]
 fn rejects_signature_verification_failed() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
     let credential = register_credential(&rp, &fixture);
 
-    let challenge = generate_challenge().unwrap();
+    let challenge = Challenge::new().unwrap();
     let mut response = fixture.make_auth_response(&challenge.bytes, ORIGIN, RP_ID, 2);
 
-    // Corrupt the signature
-    let mut bad_sig = URL_SAFE_NO_PAD.decode(&response.signature).unwrap();
-    bad_sig[10] ^= 0xFF;
-    response.signature = URL_SAFE_NO_PAD.encode(&bad_sig);
+    // Corrupt the signature by flipping a bit.
+    response.signature[10] ^= 0xFF;
 
     let err = rp
-        .verify_authentication(&credential, ORIGIN, &challenge, &response)
+        .verify_authentication(&credential, &challenge, &response)
         .unwrap_err();
     assert!(matches!(err, PassforgeError::SignatureVerificationFailed));
 }
 
 #[test]
 fn rejects_replay_attack_same_sign_count() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
     let mut credential = register_credential(&rp, &fixture);
 
-    // First successful authentication
-    let ch1 = generate_challenge().unwrap();
+    let ch1 = Challenge::new().unwrap();
     let r1 = fixture.make_auth_response(&ch1.bytes, ORIGIN, RP_ID, 2);
-    let result = rp.verify_authentication(&credential, ORIGIN, &ch1, &r1).unwrap();
+    let result = rp.verify_authentication(&credential, &ch1, &r1).unwrap();
     credential.sign_count = result.new_sign_count;
 
-    // Replay: same sign count (2) that was already consumed
-    let ch2 = generate_challenge().unwrap();
-    let r2 = fixture.make_auth_response(&ch2.bytes, ORIGIN, RP_ID, 2);
+    let ch2 = Challenge::new().unwrap();
+    let r2 = fixture.make_auth_response(&ch2.bytes, ORIGIN, RP_ID, 2); // same count
 
     let err = rp
-        .verify_authentication(&credential, ORIGIN, &ch2, &r2)
+        .verify_authentication(&credential, &ch2, &r2)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -455,22 +464,21 @@ fn rejects_replay_attack_same_sign_count() {
 
 #[test]
 fn rejects_replay_attack_lower_sign_count() {
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
     let mut credential = register_credential(&rp, &fixture);
 
-    let ch1 = generate_challenge().unwrap();
+    let ch1 = Challenge::new().unwrap();
     let r1 = fixture.make_auth_response(&ch1.bytes, ORIGIN, RP_ID, 5);
     credential.sign_count = rp
-        .verify_authentication(&credential, ORIGIN, &ch1, &r1)
+        .verify_authentication(&credential, &ch1, &r1)
         .unwrap()
         .new_sign_count;
 
-    // Replay with a lower count
-    let ch2 = generate_challenge().unwrap();
-    let r2 = fixture.make_auth_response(&ch2.bytes, ORIGIN, RP_ID, 3);
+    let ch2 = Challenge::new().unwrap();
+    let r2 = fixture.make_auth_response(&ch2.bytes, ORIGIN, RP_ID, 3); // lower
     let err = rp
-        .verify_authentication(&credential, ORIGIN, &ch2, &r2)
+        .verify_authentication(&credential, &ch2, &r2)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -483,12 +491,10 @@ fn rejects_replay_attack_lower_sign_count() {
 
 #[test]
 fn accepts_zero_sign_count_passthrough() {
-    // Authenticators that don't implement counters always send 0.
-    // The spec says to accept this case (cannot detect clones, but it's allowed).
-    let rp = RelyingParty::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
     let fixture = Fixture::new();
 
-    let reg_challenge = generate_challenge().unwrap();
+    let reg_challenge = Challenge::new().unwrap();
     let response = fixture.make_registration_response(
         &reg_challenge.bytes,
         "webauthn.create",
@@ -499,21 +505,20 @@ fn accepts_zero_sign_count_passthrough() {
         "none",
     );
     let credential = rp
-        .verify_registration(RP_ID, ORIGIN, &reg_challenge, &response, vec![])
+        .verify_registration(&reg_challenge, &response, &[])
         .unwrap()
         .credential;
 
-    let auth_challenge = generate_challenge().unwrap();
+    let auth_challenge = Challenge::new().unwrap();
     let auth_response = fixture.make_auth_response(&auth_challenge.bytes, ORIGIN, RP_ID, 0);
-    rp.verify_authentication(&credential, ORIGIN, &auth_challenge, &auth_response)
+    rp.verify_authentication(&credential, &auth_challenge, &auth_response)
         .expect("zero sign count should be accepted");
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Convenience helpers ──────────────────────────────────────────────────────
 
-/// Register a credential and return it (convenience for auth-only tests).
 fn register_credential(rp: &RelyingParty, fixture: &Fixture) -> passforge::Credential {
-    let challenge = generate_challenge().unwrap();
+    let challenge = Challenge::new().unwrap();
     let response = fixture.make_registration_response(
         &challenge.bytes,
         "webauthn.create",
@@ -523,14 +528,18 @@ fn register_credential(rp: &RelyingParty, fixture: &Fixture) -> passforge::Crede
         1,
         "none",
     );
-    rp.verify_registration(RP_ID, ORIGIN, &challenge, &response, b"uid".to_vec())
+    rp.verify_registration(&challenge, &response, b"uid")
         .unwrap()
         .credential
 }
 
-fn make_client_data_json(type_: &str, challenge: &[u8], origin: &str) -> String {
+fn make_client_data_json_bytes(type_: &str, challenge: &[u8], origin: &str) -> Vec<u8> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     let b64 = URL_SAFE_NO_PAD.encode(challenge);
-    format!(r#"{{"type":"{type_}","challenge":"{b64}","origin":"{origin}","crossOrigin":false}}"#)
+    format!(
+        r#"{{"type":"{type_}","challenge":"{b64}","origin":"{origin}","crossOrigin":false}}"#
+    )
+    .into_bytes()
 }
 
 fn make_authenticator_data(
@@ -571,10 +580,7 @@ fn encode_cose_key(uncompressed: &[u8]) -> Vec<u8> {
 
 fn make_attestation_object(auth_data: &[u8], fmt: &str) -> Vec<u8> {
     let obj = Value::Map(vec![
-        (
-            Value::Text("fmt".to_string()),
-            Value::Text(fmt.to_string()),
-        ),
+        (Value::Text("fmt".to_string()), Value::Text(fmt.to_string())),
         (Value::Text("attStmt".to_string()), Value::Map(vec![])),
         (
             Value::Text("authData".to_string()),

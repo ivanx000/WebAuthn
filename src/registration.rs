@@ -1,125 +1,201 @@
-//! Registration ceremony (W3C WebAuthn §7.1).
+//! Registration ceremony — W3C WebAuthn §7.1.
 //!
-//! The registration ceremony is how a user's authenticator creates a new credential
-//! and proves it to the relying party. The relying party's job is to:
+//! The registration ceremony is how a user's authenticator creates a new
+//! credential and proves it to the relying party. The relying party's job:
 //!
-//! 1. Verify that the response was produced for *this* challenge and *this* origin.
-//! 2. Verify that the authenticator data is bound to *this* RP ID.
+//! 1. Verify the response was produced for *this* challenge and *this* origin.
+//! 2. Verify the authenticator data is bound to *this* RP ID.
 //! 3. Extract and store the public key for future authentication.
+//!
+//! Spec: https://www.w3.org/TR/webauthn-2/#sctn-registering-a-new-credential
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ciborium::value::Value;
 use std::time::SystemTime;
 
 use crate::attestation;
 use crate::authenticator_data;
+use crate::challenge::CHALLENGE_MAX_AGE_SECS;
 use crate::client_data;
-use crate::credential::{Credential, RegistrationResult};
+use crate::credential::{
+    AuthenticatorAttestationResponse, Challenge, Credential, PublicKey, RegistrationResult,
+};
 use crate::crypto::sha256;
 use crate::error::{PassforgeError, Result};
-use crate::{AuthenticatorAttestationResponse, Challenge};
 
-/// Verify a registration response and return the new [`Credential`] to store.
+// ─── RelyingParty ─────────────────────────────────────────────────────────────
+
+/// The relying party — your server application.
 ///
-/// Call this after the client returns an `AuthenticatorAttestationResponse`.
-/// If it returns `Ok`, persist the `credential` in the result. If it returns
-/// `Err`, the registration must be rejected.
+/// `RelyingParty` is the main entry point for ceremony verification. It is
+/// stateless with respect to credentials; callers pass in the data and receive
+/// result types back. This keeps the library storage-agnostic.
 ///
-/// # Arguments
-/// * `rp_id`            — Your relying party ID, e.g. `"example.com"`.
-/// * `expected_origin`  — The exact origin of your app, e.g. `"https://example.com"`.
-/// * `challenge`        — The challenge you previously issued for this ceremony.
-/// * `response`         — The `AuthenticatorAttestationResponse` from the client.
-/// * `user_id`          — Application-level user identifier to store in the credential.
+/// Create one instance per application configuration and reuse it across
+/// ceremonies. `RelyingParty` is `Clone`, so it can be shared via `Arc` in
+/// an async context.
 ///
-/// # Spec reference
-/// W3C WebAuthn §7.1 "Registering a New Credential"
-pub fn verify(
-    rp_id: &str,
-    expected_origin: &str,
+/// # Example
+///
+/// ```rust,no_run
+/// use passforge::RelyingParty;
+///
+/// let rp = RelyingParty::new("example.com", "https://example.com", "My Service");
+/// ```
+#[derive(Debug, Clone)]
+pub struct RelyingParty {
+    /// Relying party ID, e.g. `"example.com"`.
+    ///
+    /// Must match the `rpId` used in the browser's
+    /// `navigator.credentials.create()` / `get()` call options.
+    pub id: String,
+
+    /// Full origin of the web app, e.g. `"https://example.com"`.
+    ///
+    /// Must match `window.location.origin` in the browser exactly — scheme,
+    /// host, and port all matter.
+    pub origin: String,
+
+    /// Human-readable name shown to users, e.g. `"My Service"`.
+    pub name: String,
+}
+
+impl RelyingParty {
+    /// Create a new `RelyingParty` with the given configuration.
+    ///
+    /// # Arguments
+    /// * `id`     — Relying party ID, e.g. `"example.com"`.
+    /// * `origin` — Full app origin, e.g. `"https://example.com"`.
+    /// * `name`   — Human-readable service name.
+    pub fn new(id: &str, origin: &str, name: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            origin: origin.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    /// Verify a registration ceremony response (W3C WebAuthn §7.1).
+    ///
+    /// Call this after the client returns an `AuthenticatorAttestationResponse`.
+    /// On `Ok`, persist `result.credential` in your database. On `Err`, reject
+    /// the registration and return an appropriate error to the client.
+    ///
+    /// # Arguments
+    /// * `challenge` — The challenge you issued for this ceremony.
+    /// * `response`  — The raw attestation response from the authenticator.
+    /// * `user_id`   — Your application's identifier for this user.
+    ///
+    /// # Errors
+    /// Returns a [`PassforgeError`] variant indicating exactly which
+    /// verification step failed.
+    pub fn verify_registration(
+        &self,
+        challenge: &Challenge,
+        response: &AuthenticatorAttestationResponse,
+        user_id: &[u8],
+    ) -> Result<RegistrationResult> {
+        verify_registration_inner(self, challenge, response, user_id)
+    }
+}
+
+// ─── Ceremony implementation ──────────────────────────────────────────────────
+
+fn verify_registration_inner(
+    rp: &RelyingParty,
     challenge: &Challenge,
     response: &AuthenticatorAttestationResponse,
-    user_id: Vec<u8>,
+    user_id: &[u8],
 ) -> Result<RegistrationResult> {
-    // ── §7.1 step 5 ──────────────────────────────────────────────────────────
-    // Parse clientDataJSON: base64url-decode, then parse JSON.
-    let (client_data, client_data_json_bytes) = client_data::parse(&response.client_data_json)?;
-
-    // ── §7.1 step 7 ──────────────────────────────────────────────────────────
-    // Verify the type is "webauthn.create".
-    if client_data.type_ != "webauthn.create" {
-        return Err(PassforgeError::InvalidClientData(format!(
-            "expected type \"webauthn.create\", got \"{}\"",
-            client_data.type_
-        )));
+    // ── Pre-check: challenge expiry ───────────────────────────────────────────
+    // The spec does not specify where to check this, but rejecting an expired
+    // challenge before doing any crypto is the most efficient ordering.
+    if challenge.is_expired(CHALLENGE_MAX_AGE_SECS) {
+        return Err(PassforgeError::ChallengeExpired);
     }
 
-    // ── §7.1 step 8 ──────────────────────────────────────────────────────────
-    // Verify the challenge: decode the challenge from client data and compare
-    // it byte-for-byte with the challenge the relying party issued.
-    if client_data.challenge != challenge.bytes {
-        return Err(PassforgeError::ChallengeMismatch);
-    }
+    // ── §7.1 step 5 ───────────────────────────────────────────────────────────
+    // Let JSONtext be the UTF-8 decoding of response.clientDataJSON.
+    // response.client_data_json already holds the raw bytes; validate UTF-8.
+    let _ = std::str::from_utf8(&response.client_data_json).map_err(|_| {
+        PassforgeError::InvalidClientData("clientDataJSON is not valid UTF-8".to_string())
+    })?;
 
-    // ── §7.1 step 9 ──────────────────────────────────────────────────────────
-    // Verify the origin matches exactly.
-    if client_data.origin != expected_origin {
-        return Err(PassforgeError::OriginMismatch);
-    }
+    // ── §7.1 step 6 ───────────────────────────────────────────────────────────
+    // Parse clientDataJSON bytes into a CollectedClientData structure.
+    let parsed_cd = client_data::parse_client_data(&response.client_data_json)?;
 
-    // ── §7.1 step 11 ─────────────────────────────────────────────────────────
-    // Hash clientDataJSON with SHA-256. This becomes the clientDataHash that
-    // is included in the signed data during authentication.
-    let client_data_hash = sha256(&client_data_json_bytes);
+    // ── §7.1 step 7 ───────────────────────────────────────────────────────────
+    // Verify that C.type equals "webauthn.create".
+    // ── §7.1 step 8 ───────────────────────────────────────────────────────────
+    // Verify that C.challenge equals the issued challenge.
+    // ── §7.1 step 9 ───────────────────────────────────────────────────────────
+    // Verify that C.origin matches the relying party's origin.
+    client_data::validate_client_data(&parsed_cd, "webauthn.create", &challenge.bytes, &rp.origin)?;
 
-    // ── §7.1 step 12 ─────────────────────────────────────────────────────────
-    // Decode the attestation object: base64url → CBOR.
-    let att_obj_bytes = URL_SAFE_NO_PAD
-        .decode(&response.attestation_object)
-        .map_err(|e| PassforgeError::Base64DecodeError(format!("attestationObject: {e}")))?;
+    // ── §7.1 step 11 ──────────────────────────────────────────────────────────
+    // Let hash be SHA-256(clientDataJSON bytes).
+    let client_data_hash = sha256(&parsed_cd.raw_json);
 
-    // ── §7.1 step 13 ─────────────────────────────────────────────────────────
-    // Parse the CBOR attestation object, extracting fmt and authData.
-    let (fmt, auth_data_bytes) = parse_attestation_object(&att_obj_bytes)?;
+    // ── §7.1 step 12 ──────────────────────────────────────────────────────────
+    // Perform CBOR decoding on the attestationObject.
+    let (fmt, auth_data_bytes) = parse_attestation_object(&response.attestation_object)?;
 
-    // ── §7.1 step 14 ─────────────────────────────────────────────────────────
-    // Parse the raw authenticator data bytes.
-    let auth_data = authenticator_data::parse(&auth_data_bytes)?;
+    // ── §7.1 step 9 (authData) ────────────────────────────────────────────────
+    // Parse the raw authenticator data bytes into a typed structure.
+    let auth_data = authenticator_data::parse_authenticator_data(&auth_data_bytes)?;
 
-    // ── §7.1 step 15 ─────────────────────────────────────────────────────────
-    // Verify rpIdHash = SHA-256(rp_id). This binds the credential to this RP.
-    let expected_rp_id_hash = sha256(rp_id.as_bytes());
+    // ── §7.1 step 13 ──────────────────────────────────────────────────────────
+    // Verify that the rpIdHash in authData is SHA-256(rp.id).
+    let expected_rp_id_hash = sha256(rp.id.as_bytes());
     if auth_data.rp_id_hash != expected_rp_id_hash {
         return Err(PassforgeError::RpIdHashMismatch);
     }
 
-    // ── §7.1 step 16 ─────────────────────────────────────────────────────────
-    // Verify the User Present (UP) flag. A registration without UP is invalid.
+    // ── §7.1 step 14 ──────────────────────────────────────────────────────────
+    // Verify that the User Present (UP) flag is set.
+    // A registration without UP is invalid — the user must have been present.
     if !auth_data.flags.user_present {
         return Err(PassforgeError::UserNotPresent);
     }
 
-    // ── §7.1 step 21 ─────────────────────────────────────────────────────────
-    // Extract the attested credential data (public key, credential ID).
-    // This must be present during registration (AT flag must be set).
+    // ── §7.1 step 16 ──────────────────────────────────────────────────────────
+    // Verify that the AT (Attested Credential Data) flag is set.
+    // If absent, the authenticator did not include a public key — unusable.
     let cred_data = auth_data.attested_credential_data.ok_or_else(|| {
         PassforgeError::InvalidAuthenticatorData(
             "attested credential data (AT flag) is required for registration".to_string(),
         )
     })?;
 
-    // ── §7.1 step 22 ─────────────────────────────────────────────────────────
-    // Verify the attestation statement.
-    let attestation_type = attestation::verify(&fmt, &auth_data_bytes, &client_data_hash)?;
+    // ── §7.1 step 17 ──────────────────────────────────────────────────────────
+    // Extract the COSE public key from the attested credential data.
+    let cose_key = cred_data.public_key;
 
-    // ── §7.1 step 25 ─────────────────────────────────────────────────────────
-    // Assemble and return the credential. The caller must persist this.
+    // ── §7.1 step 17 (algorithm check) ────────────────────────────────────────
+    // Verify the algorithm is ES256 (COSE alg = -7). Reject anything else
+    // because we have no verification path for other algorithms yet.
+    if cose_key.alg != -7 {
+        return Err(PassforgeError::UnsupportedAlgorithm(cose_key.alg));
+    }
+
+    // Convert the CoseKey into our typed PublicKey.
+    let public_key = PublicKey::ES256 {
+        x: cose_key.x,
+        y: cose_key.y,
+    };
+
+    // ── §7.1 step 19 ──────────────────────────────────────────────────────────
+    // Verify the attestation statement.
+    let attestation_type = attestation::verify(&fmt, &auth_data.raw, &client_data_hash)?;
+
+    // ── §7.1 step 25 ──────────────────────────────────────────────────────────
+    // Build the Credential. The caller must persist this object.
     let credential = Credential {
         id: cred_data.credential_id,
-        public_key: cred_data.public_key,
+        public_key,
         sign_count: auth_data.sign_count,
-        user_id,
-        rp_id: rp_id.to_string(),
+        user_id: user_id.to_vec(),
+        rp_id: rp.id.clone(),
         created_at: SystemTime::now(),
     };
 
@@ -129,12 +205,14 @@ pub fn verify(
     })
 }
 
+// ─── CBOR attestation object ──────────────────────────────────────────────────
+
 /// Decode the CBOR attestation object and return `(fmt, authData bytes)`.
 ///
-/// The attestation object is a CBOR map with at least these keys:
-/// - `"fmt"` (text): the attestation format
-/// - `"attStmt"` (map): the attestation statement (verified separately)
-/// - `"authData"` (bytes): the raw authenticator data
+/// The attestation object is a CBOR map with at least:
+/// - `"fmt"`      (text): attestation format
+/// - `"attStmt"`  (map):  attestation statement (handled by `attestation::verify`)
+/// - `"authData"` (bytes): raw authenticator data
 fn parse_attestation_object(data: &[u8]) -> Result<(String, Vec<u8>)> {
     let value: Value = ciborium::from_reader(data)
         .map_err(|e| PassforgeError::CborDecodeError(format!("attestation object: {e}")))?;
@@ -163,7 +241,7 @@ fn parse_attestation_object(data: &[u8]) -> Result<(String, Vec<u8>)> {
                     auth_data = Some(b);
                 }
             }
-            // "attStmt" is intentionally ignored here; attestation::verify handles it.
+            // "attStmt" is handled by attestation::verify — not needed here.
             _ => {}
         }
     }
@@ -178,13 +256,14 @@ fn parse_attestation_object(data: &[u8]) -> Result<(String, Vec<u8>)> {
     Ok((fmt, auth_data))
 }
 
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn rejects_invalid_attestation_object_cbor() {
-        // 0xFF is a CBOR "break" code, which is invalid at the start of a data item.
         let bad_bytes = &[0xFF, 0x00, 0x00];
         let result = parse_attestation_object(bad_bytes);
         assert!(matches!(result, Err(PassforgeError::CborDecodeError(_))));
@@ -192,7 +271,6 @@ mod tests {
 
     #[test]
     fn rejects_attestation_object_that_is_not_a_map() {
-        // Valid CBOR (integer 0) but not a map — should produce InvalidAttestationObject.
         let integer_cbor = &[0x00u8]; // CBOR integer 0
         let result = parse_attestation_object(integer_cbor);
         assert!(matches!(
@@ -203,7 +281,6 @@ mod tests {
 
     #[test]
     fn rejects_attestation_object_missing_fmt() {
-        // Valid CBOR map but missing the "fmt" key
         let mut buf = Vec::new();
         let v = Value::Map(vec![(
             Value::Text("authData".to_string()),
