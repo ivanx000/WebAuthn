@@ -1,7 +1,7 @@
 //! End-to-end WebAuthn simulation without a browser.
 //!
 //! This demo simulates both sides of the WebAuthn protocol in software:
-//! - **Relying party**: uses the passforge library (the code under test)
+//! - **Relying party**: uses the webauthn library (the code under test)
 //! - **Authenticator**: simulated using ring's P-256 ECDSA primitives
 //!
 //! Run with: `cargo run --example demo`
@@ -16,66 +16,54 @@ use ciborium::value::Value;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
-use passforge::{
+use webauthn::{
     AuthenticatorAssertionResponse, AuthenticatorAttestationResponse, Challenge, RelyingParty,
 };
 
 // ─── Demo configuration ───────────────────────────────────────────────────────
 
 const RP_ID: &str = "localhost";
-const ORIGIN: &str = "http://localhost:8080";
+const ORIGIN: &str = "http://localhost";
 const USER_ID: &[u8] = b"demo-user-001";
 
 fn main() -> Result<()> {
-    println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║          passforge — WebAuthn Demo (ES256 / P-256)       ║");
-    println!("╚══════════════════════════════════════════════════════════╝\n");
+    println!("🔑 WebAuthn demo");
+    println!("─────────────────────────────────────");
 
     let rng = SystemRandom::new();
 
-    // Configure the relying party.
-    let rp = RelyingParty::new(RP_ID, ORIGIN, "passforge Demo");
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "WebAuthn Demo");
 
     // ── Step 1: Generate authenticator keypair ────────────────────────────────
-    println!("── Authenticator: Generating P-256 keypair ─────────────────");
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
         .map_err(|e| anyhow::anyhow!("failed to generate PKCS8 keypair: {e}"))?;
     let key_pair =
         EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
             .map_err(|e| anyhow::anyhow!("failed to load key pair: {e}"))?;
 
-    // The public key is an uncompressed P-256 point: 0x04 || x (32) || y (32).
     let public_key_bytes = key_pair.public_key().as_ref().to_vec();
 
-    // Credential ID: 16 random bytes (authenticator-chosen opaque identifier).
     let mut cred_id = vec![0u8; 16];
     ring::rand::SecureRandom::fill(&rng, &mut cred_id)
         .map_err(|e| anyhow::anyhow!("failed to generate credential ID: {e}"))?;
 
     // ── Step 2: Registration ceremony ────────────────────────────────────────
-    println!("── Registration Ceremony ───────────────────────────────────");
+    println!("\n[Registration]");
 
     let reg_challenge = Challenge::new().context("failed to generate challenge")?;
 
-    // Simulate the authenticator building clientDataJSON (raw UTF-8 bytes).
-    let client_data_json_bytes = make_client_data_json_bytes(
-        "webauthn.create",
-        &reg_challenge.bytes,
-        ORIGIN,
-    );
+    let client_data_json_bytes =
+        make_client_data_json_bytes("webauthn.create", &reg_challenge.bytes, ORIGIN);
 
-    // Simulate the authenticator building authenticatorData.
     let auth_data_bytes = make_authenticator_data(
         RP_ID,
         0x41, // flags: UP=1 (bit 0), AT=1 (bit 6)
-        1,    // initial sign count
+        0,    // sign count 0 — initial registration
         Some((&cred_id, &public_key_bytes)),
     );
 
-    // Build the CBOR attestation object: { fmt: "none", attStmt: {}, authData: ... }.
     let attestation_object_bytes = make_attestation_object(&auth_data_bytes);
 
-    // Wire type fields are raw bytes — no base64url encoding needed.
     let reg_response = AuthenticatorAttestationResponse {
         client_data_json: client_data_json_bytes,
         attestation_object: attestation_object_bytes,
@@ -85,14 +73,22 @@ fn main() -> Result<()> {
         .verify_registration(&reg_challenge, &reg_response, USER_ID)
         .context("registration verification failed")?;
 
-    println!("   Attestation type: {:?}", reg_result.attestation_type);
-    println!("   Initial sign count: {}", reg_result.credential.sign_count);
-    println!("✅ Registration successful\n");
+    let cred_id_hex: String = reg_result
+        .credential
+        .id
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    println!("✅ Registration successful");
+    println!("   Credential ID: {cred_id_hex}");
+    println!("   Algorithm:     ES256");
+    println!("   Sign count:    {}", reg_result.credential.sign_count);
 
     let mut stored_credential = reg_result.credential;
 
-    // ── Step 3: Authentication ceremony (first, valid) ────────────────────────
-    println!("── Authentication Ceremony (sign count 1 → 2) ──────────────");
+    // ── Step 3: Authentication ceremony ──────────────────────────────────────
+    println!("\n[Authentication]");
 
     let auth_challenge = Challenge::new().context("failed to generate challenge")?;
 
@@ -102,23 +98,27 @@ fn main() -> Result<()> {
         &auth_challenge.bytes,
         RP_ID,
         ORIGIN,
-        2, // sign count incremented from 1 to 2
+        1, // sign count incremented from 0 to 1
     )?;
 
     let auth_result = rp
         .verify_authentication(&stored_credential, &auth_challenge, &auth_response)
-        .context("first authentication failed")?;
+        .context("authentication failed")?;
 
-    println!("   User verified flag: {}", auth_result.user_verified);
-    println!("   New sign count: {}", auth_result.new_sign_count);
-    println!("✅ Authentication successful\n");
+    println!("✅ Authentication successful");
+    println!(
+        "   Sign count:    {} → updated to {}",
+        stored_credential.sign_count, auth_result.new_sign_count
+    );
+    println!("   User present:  {}", auth_result.user_present);
+    println!("   User verified: {}", auth_result.user_verified);
 
     stored_credential.sign_count = auth_result.new_sign_count;
 
     // ── Step 4: Replay attack demonstration ───────────────────────────────────
-    println!("── Replay Attack Demonstration ─────────────────────────────");
-    println!("   Attacker replays the previous sign count (2) — should be rejected.");
+    println!("\n[Replay Attack Prevention]");
 
+    // Replay the same sign count (1) — should fail because stored is now 1
     let replay_challenge = Challenge::new().context("failed to generate challenge")?;
     let replay_response = make_auth_response(
         &key_pair,
@@ -126,26 +126,27 @@ fn main() -> Result<()> {
         &replay_challenge.bytes,
         RP_ID,
         ORIGIN,
-        2, // same sign count — this is the attack
+        1, // same sign count — replay attack
     )?;
 
     match rp.verify_authentication(&stored_credential, &replay_challenge, &replay_response) {
-        Err(passforge::PassforgeError::SignCountInvalid { stored, received }) => {
+        Err(webauthn::PassforgeError::SignCountInvalid { stored, received }) => {
+            println!("✅ Replay attack correctly rejected");
             println!(
-                "   Replay REJECTED — SignCountInvalid {{ stored: {stored}, received: {received} }}"
+                "   Error: Sign count invalid: stored {stored}, received {received}"
             );
         }
         Ok(_) => panic!("BUG: replay attack should have been rejected!"),
         Err(e) => return Err(e.into()),
     }
 
-    println!("\n── All checks passed. Demo complete. ───────────────────────");
+    println!("\n─────────────────────────────────────");
+    println!("All checks passed.");
     Ok(())
 }
 
 // ─── Authenticator simulation helpers ─────────────────────────────────────────
 
-/// Build `clientDataJSON` bytes as a browser would produce them.
 fn make_client_data_json_bytes(type_: &str, challenge: &[u8], origin: &str) -> Vec<u8> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     let challenge_b64 = URL_SAFE_NO_PAD.encode(challenge);
@@ -164,7 +165,7 @@ fn make_authenticator_data(
     sign_count: u32,
     cred_data: Option<(&[u8], &[u8])>,
 ) -> Vec<u8> {
-    let rp_id_hash = passforge::crypto::sha256(rp_id.as_bytes());
+    let rp_id_hash = webauthn::crypto::sha256(rp_id.as_bytes());
 
     let mut out = Vec::new();
     out.extend_from_slice(&rp_id_hash);
@@ -182,14 +183,13 @@ fn make_authenticator_data(
     out
 }
 
-/// Encode a P-256 uncompressed point (0x04 || x || y) as a COSE_Key CBOR map.
 fn encode_cose_key(uncompressed_point: &[u8]) -> Vec<u8> {
     assert_eq!(uncompressed_point.len(), 65, "expected 0x04 || x(32) || y(32)");
     let x = uncompressed_point[1..33].to_vec();
     let y = uncompressed_point[33..65].to_vec();
 
     let cose_key = Value::Map(vec![
-        (Value::Integer(1i64.into()), Value::Integer(2i64.into())),   // kty: EC2
+        (Value::Integer(1i64.into()), Value::Integer(2i64.into())),    // kty: EC2
         (Value::Integer(3i64.into()), Value::Integer((-7i64).into())), // alg: ES256
         (Value::Integer((-1i64).into()), Value::Integer(1i64.into())), // crv: P-256
         (Value::Integer((-2i64).into()), Value::Bytes(x)),             // x
@@ -201,7 +201,6 @@ fn encode_cose_key(uncompressed_point: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Build a CBOR attestation object with "none" attestation.
 fn make_attestation_object(auth_data: &[u8]) -> Vec<u8> {
     let att_obj = Value::Map(vec![
         (Value::Text("fmt".to_string()), Value::Text("none".to_string())),
@@ -214,7 +213,6 @@ fn make_attestation_object(auth_data: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Build a complete `AuthenticatorAssertionResponse` using the given keypair.
 fn make_auth_response(
     key_pair: &EcdsaKeyPair,
     rng: &SystemRandom,
@@ -226,7 +224,7 @@ fn make_auth_response(
     let client_data_bytes = make_client_data_json_bytes("webauthn.get", challenge, origin);
     let auth_data_bytes = make_authenticator_data(rp_id, 0x01, sign_count, None);
 
-    let client_data_hash = passforge::crypto::sha256(&client_data_bytes);
+    let client_data_hash = webauthn::crypto::sha256(&client_data_bytes);
     let mut signed_data = auth_data_bytes.clone();
     signed_data.extend_from_slice(&client_data_hash);
 

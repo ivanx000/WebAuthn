@@ -20,7 +20,7 @@ labels: bug
 
 ## Environment
 
-- passforge version (git SHA or crate version):
+- webauthn version (git SHA or crate version):
 - Rust toolchain (`rustup show`):
 - OS:
 

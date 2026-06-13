@@ -1,10 +1,10 @@
-# passforge
+# WebAuthn
 
-A WebAuthn / Passkey relying-party library written in Rust.
+A WebAuthn relying-party library written in Rust.
 
-passforge implements the server-side ceremony verification logic for both WebAuthn
+This library implements the server-side ceremony verification logic for both WebAuthn
 flows — registration and authentication — following the
-[W3C WebAuthn Level 3 specification](https://www.w3.org/TR/webauthn-3/).
+[W3C WebAuthn Level 2 specification](https://www.w3.org/TR/webauthn-2/).
 It is built as a portfolio project demonstrating practical applied cryptography,
 correct protocol implementation, and idiomatic Rust.
 
@@ -55,57 +55,45 @@ and cryptographic operations without adding surface area that obscures the desig
 ## Quick start
 
 ```rust
-use passforge::{RelyingParty, AuthenticatorAttestationResponse,
-                AuthenticatorAssertionResponse, generate_challenge};
+use webauthn::{RelyingParty, AuthenticatorAttestationResponse,
+               AuthenticatorAssertionResponse, Challenge};
 
-let rp = RelyingParty::new();
+// 1. Configure the relying party once, at startup.
+let rp = RelyingParty::new("example.com", "https://example.com", "My Service");
 
 // ── Registration ──────────────────────────────────────────
-// 1. Generate a challenge and send it to the browser
-let reg_challenge = generate_challenge()?;
+// 2. Generate a challenge and send it to the browser.
+let reg_challenge = Challenge::new()?;
 
-// 2. Browser calls navigator.credentials.create() and returns:
+// 3. Browser calls navigator.credentials.create() and returns:
 let reg_response = AuthenticatorAttestationResponse {
-    client_data_json: todo!("base64url from browser"),
-    attestation_object: todo!("base64url from browser"),
+    client_data_json:   todo!("raw bytes from browser response"),
+    attestation_object: todo!("raw bytes from browser response"),
 };
 
-// 3. Verify and store the credential
-let result = rp.verify_registration(
-    "example.com",          // RP ID
-    "https://example.com",  // origin
-    &reg_challenge,
-    &reg_response,
-    b"user-id-42".to_vec(),
-)?;
-
-// store result.credential in your database
-let mut stored = result.credential;
+// 4. Verify and store the credential.
+let result = rp.verify_registration(&reg_challenge, &reg_response, b"user-id-42")?;
+let mut stored = result.credential; // persist this in your database
 
 // ── Authentication ────────────────────────────────────────
-// 4. Issue a new challenge
-let auth_challenge = generate_challenge()?;
+// 5. Issue a new challenge (never reuse challenges).
+let auth_challenge = Challenge::new()?;
 
-// 5. Browser calls navigator.credentials.get() and returns:
+// 6. Browser calls navigator.credentials.get() and returns:
 let auth_response = AuthenticatorAssertionResponse {
-    client_data_json: todo!("base64url from browser"),
-    authenticator_data: todo!("base64url from browser"),
-    signature: todo!("base64url from browser"),
-    user_handle: None,
+    client_data_json:   todo!("raw bytes from browser response"),
+    authenticator_data: todo!("raw bytes from browser response"),
+    signature:          todo!("raw bytes from browser response"),
+    user_handle:        None,
 };
 
-// 6. Verify, then update the stored sign count
-let auth_result = rp.verify_authentication(
-    &stored,
-    "https://example.com",
-    &auth_challenge,
-    &auth_response,
-)?;
-
+// 7. Verify, then update the stored sign count.
+let auth_result = rp.verify_authentication(&stored, &auth_challenge, &auth_response)?;
 stored.sign_count = auth_result.new_sign_count;
 ```
 
-Run the self-contained demo to see this in action without a browser:
+Run the self-contained demo to see a full registration → authentication → replay-attack
+sequence without a browser:
 
 ```
 cargo run --example demo
@@ -117,7 +105,7 @@ cargo run --example demo
 
 ```
 cargo test          # unit + integration tests
-cargo clippy        # lint
+cargo clippy        # lint (zero-warning policy)
 cargo doc --open    # API documentation
 ```
 
@@ -153,7 +141,7 @@ cargo doc --open    # API documentation
 |----------------|-------|
 | Credential storage | A durable, indexed key-value store keyed by credential ID |
 | Single-use challenges | Invalidate each challenge after it is used or expires |
-| Challenge expiry | `passforge::challenge::is_expired()` checks a 5-minute window |
+| Challenge expiry | `webauthn::challenge::is_expired()` checks a 5-minute window |
 | HTTPS | WebAuthn requires a secure context; enforce TLS at the transport layer |
 | Sign-count update | After successful auth, write `auth_result.new_sign_count` back |
 | User enumeration prevention | Return the same error for unknown vs. invalid credential |
@@ -187,7 +175,7 @@ cargo doc --open    # API documentation
 
 ## References
 
-- [W3C Web Authentication Level 3](https://www.w3.org/TR/webauthn-3/)
+- [W3C Web Authentication Level 2](https://www.w3.org/TR/webauthn-2/)
 - [FIDO Alliance CTAP2 specification](https://fidoalliance.org/specs/fido-v2.0-ps-20190130/)
 - [RFC 8152 — CBOR Object Signing and Encryption (COSE)](https://www.rfc-editor.org/rfc/rfc8152)
 - [NIST SP 800-63B — Digital Identity Guidelines](https://pages.nist.gov/800-63-3/sp800-63b.html)

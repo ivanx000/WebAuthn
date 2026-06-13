@@ -1,6 +1,6 @@
 # /check
 
-Run the full passforge quality suite and report results.
+Run the full WebAuthn quality suite and report results.
 
 ## Steps
 
@@ -31,7 +31,7 @@ Run each check sequentially and collect pass/fail status:
 After all checks complete, print a summary table:
 
 ```
-=== passforge quality check ===
+=== WebAuthn quality check ===
 ✅ cargo build
 ✅ cargo clippy (zero warnings)
 ✅ cargo test   (N tests passed)
@@ -43,7 +43,7 @@ All checks passed.
 Or if any fail:
 
 ```
-=== passforge quality check ===
+=== WebAuthn quality check ===
 ✅ cargo build
 ❌ cargo clippy — N warnings found
 ✅ cargo test   (N tests passed)

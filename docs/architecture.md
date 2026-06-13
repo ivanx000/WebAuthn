@@ -1,13 +1,13 @@
 # Architecture
 
-How passforge is structured and why.
+How this WebAuthn library is structured and why.
 
 ---
 
 ## Module map
 
 ```
-passforge
+webauthn
 ├── lib.rs                  Public API surface
 │   └── RelyingParty        Stateless ceremony verifier (entry point)
 │   └── AuthenticatorAttestationResponse   Registration wire type
@@ -25,28 +25,28 @@ passforge
 │
 ├── crypto.rs               Cryptographic primitives (delegated to ring)
 │   ├── sha256()            SHA-256 digest
-│   ├── verify_es256_signature()   ECDSA P-256 verification
-│   └── generate_challenge()       32-byte CSPRNG challenge
+│   ├── verify_es256()      ECDSA P-256 verification
+│   └── generate_challenge() 32-byte CSPRNG challenge
 │
 ├── challenge.rs            Challenge lifecycle helpers
 │   ├── is_expired()        Checks against 5-minute default
 │   └── is_expired_with_max_age()  Configurable expiry
 │
 ├── client_data.rs          clientDataJSON parsing
-│   └── parse()             base64url → UTF-8 → JSON → ClientData
+│   └── parse_client_data() base64url → UTF-8 → JSON → ClientData
 │
 ├── authenticator_data.rs   Binary authenticator data parsing
-│   ├── parse()             Raw bytes → AuthenticatorData
+│   ├── parse_authenticator_data()  Raw bytes → AuthenticatorData
 │   └── (internal) parse_cose_key()  CBOR COSE key → PublicKey
 │
 ├── attestation.rs          Attestation statement verification
 │   └── verify()            Only "none" format currently supported
 │
 ├── registration.rs         §7.1 registration ceremony
-│   └── verify()            All steps in spec order, cited by step number
+│   └── verify_registration()  All steps in spec order, cited by step number
 │
 └── authentication.rs       §7.2 authentication ceremony
-    └── verify()            All steps in spec order, cited by step number
+    └── verify_authentication()  All steps in spec order, cited by step number
 ```
 
 ---
@@ -56,15 +56,15 @@ passforge
 ```
 AuthenticatorAttestationResponse
     │
-    │  client_data_json  (base64url)
-    ├─► base64url::decode → UTF-8 bytes → serde_json::parse → ClientData
+    │  client_data_json  (raw bytes)
+    ├─► UTF-8 decode → serde_json::parse → ClientData
     │     │
     │     ├─ verify type == "webauthn.create"
     │     ├─ verify challenge bytes match issued challenge
     │     └─ verify origin == expected_origin
     │
-    │  attestation_object  (base64url)
-    └─► base64url::decode → CBOR bytes → ciborium::parse → {fmt, authData}
+    │  attestation_object  (raw bytes)
+    └─► CBOR decode (ciborium) → {fmt, authData}
           │
           │  authData  (raw bytes)
           └─► parse_authenticator_data()
@@ -85,25 +85,32 @@ AuthenticatorAttestationResponse
 ## Data flow: authentication
 
 ```
-AuthenticatorAssertionResponse
-    │
-    ├─ client_data_json  → same parsing as registration, type must be "webauthn.get"
-    │     └─ SHA-256(client_data_json_bytes) → clientDataHash
-    │
-    ├─ authenticator_data  (base64url)
-    │     └─► base64url::decode → parse_authenticator_data()
-    │           ├─ verify rp_id_hash
-    │           └─ verify UP flag
-    │
-    ├─ signature  (base64url DER-encoded ECDSA)
-    │
-    └─ Verify signature:
-          message = auth_data_bytes || clientDataHash
-          ring::signature::UnparsedPublicKey::verify(message, signature)
-              └─ internal: SHA-256(message), ECDSA verify with stored public key
-
-→ verify sign_count > stored (replay protection)
-→ AuthenticationResult { credential_id, new_sign_count, user_verified }
+Stored Credential + AuthenticatorAssertionResponse
+               │
+        parse_client_data()
+         [type="webauthn.get"]
+               │
+        validate_client_data()
+         challenge match + origin match
+               │
+        SHA-256(clientDataJSON bytes) → clientDataHash
+               │
+        parse_authenticator_data()
+         [verify rpIdHash + UP flag]
+               │
+        build verification data:
+        authData bytes || clientDataHash
+               │
+        verify_es256(stored_public_key, data, signature)
+         [ring ECDSA_P256_SHA256_ASN1]
+               │
+        check sign_count > stored
+         [SignCountInvalid if not]
+               │
+        return AuthenticationResult {
+          credential_id, new_sign_count,
+          user_present, user_verified
+        }
 ```
 
 ---
@@ -149,7 +156,7 @@ for persistence.
 types — they match the shape of the `navigator.credentials` API in browsers. The
 internal types (`ClientData`, `AuthenticatorData`) are richer, fully parsed
 representations. Keeping them separate means the parsing code is testable
-independently of the base64 decoding layer.
+independently of the rest of the verification logic.
 
 ### Why does the public key use the uncompressed point format?
 
@@ -158,14 +165,14 @@ points: `0x04 || x (32 bytes) || y (32 bytes)`. This is the ANSI X9.62 format
 and the one most commonly found in the WebAuthn ecosystem. Storing the key in
 this format means no conversion is needed at authentication time.
 
-COSE keys use raw `x` and `y` bytes separately. passforge extracts them and
+COSE keys use raw `x` and `y` bytes separately. This library extracts them and
 reassembles the uncompressed point when parsing the registration response.
 
 ---
 
 ## Spec compliance reference
 
-| Spec section | passforge location |
+| Spec section | Library location |
 |---|---|
 | §6.1 Authenticator Data | `authenticator_data.rs` |
 | §6.5 Attestation | `attestation.rs` |

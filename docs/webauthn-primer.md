@@ -152,6 +152,32 @@ cannot be presented to `bank.com`).
 
 ---
 
+## Sign count and replay attack prevention
+
+The sign count is a monotonically increasing integer stored in the authenticator.
+The relying party keeps the last-seen count and rejects any assertion where the
+received count is not strictly greater.
+
+**Why this matters:** if an attacker clones an authenticator (copies the private key
+to another device), both devices start from the same counter. When the legitimate
+user authenticates and bumps the count, the cloned device's next attempt will have a
+lower count — and the relying party will reject it as `SignCountInvalid`.
+
+**The both-zero case:** some authenticators (and all synced passkeys) report a sign
+count of zero. The spec permits this, and the library accepts it. No clone detection
+is available for these authenticators — this is expected behavior for passkeys that
+sync across devices.
+
+```
+stored = 3  →  received = 4  ✅ accepted, update stored to 4
+stored = 3  →  received = 3  ❌ SignCountInvalid (equal, not strictly greater)
+stored = 3  →  received = 2  ❌ SignCountInvalid (lower)
+stored = 0  →  received = 0  ✅ accepted (authenticator without counter)
+stored = 0  →  received = 1  ✅ accepted
+```
+
+---
+
 ## What the relying party is responsible for
 
 The relying party (server) must:

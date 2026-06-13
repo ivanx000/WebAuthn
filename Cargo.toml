@@ -1,8 +1,8 @@
 [package]
-name = "passforge"
+name = "webauthn"
 version = "0.1.0"
 edition = "2021"
-description = "WebAuthn / Passkey relying-party library — server-side registration and authentication ceremonies"
+description = "WebAuthn relying-party library — server-side registration and authentication ceremonies"
 keywords = ["webauthn", "passkey", "fido2", "authentication", "cryptography"]
 categories = ["authentication", "cryptography"]
 license = "MIT"

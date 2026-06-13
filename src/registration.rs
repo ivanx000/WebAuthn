@@ -1,11 +1,11 @@
 //! Registration ceremony — W3C WebAuthn §7.1.
 //!
 //! The registration ceremony is how a user's authenticator creates a new
-//! credential and proves it to the relying party. The relying party's job:
+//! credential and proves it to the relying party. The relying party verifies:
 //!
-//! 1. Verify the response was produced for *this* challenge and *this* origin.
-//! 2. Verify the authenticator data is bound to *this* RP ID.
-//! 3. Extract and store the public key for future authentication.
+//! 1. The response was produced for *this* challenge and *this* origin.
+//! 2. The authenticator data is bound to *this* RP ID.
+//! 3. The public key is valid and can be stored for future authentication.
 //!
 //! Spec: https://www.w3.org/TR/webauthn-2/#sctn-registering-a-new-credential
 
@@ -37,7 +37,7 @@ use crate::error::{PassforgeError, Result};
 /// # Example
 ///
 /// ```rust,no_run
-/// use passforge::RelyingParty;
+/// use webauthn::RelyingParty;
 ///
 /// let rp = RelyingParty::new("example.com", "https://example.com", "My Service");
 /// ```

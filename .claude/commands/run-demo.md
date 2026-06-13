@@ -1,6 +1,6 @@
 # /run-demo
 
-Run the end-to-end passforge demo binary and print its output.
+Run the end-to-end webauthn demo binary and print its output.
 
 ## Steps
 

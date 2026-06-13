@@ -1,6 +1,6 @@
 # /status
 
-Print a project health summary for passforge.
+Print a project health summary for WebAuthn.
 
 ## Steps
 
@@ -39,7 +39,7 @@ Run each of the following and aggregate results:
 ## Output format
 
 ```
-=== passforge project status ===
+=== WebAuthn project status ===
 Branch:   main
 Commit:   abc1234 feat: add EdDSA support
 Unstaged: 0 files changed

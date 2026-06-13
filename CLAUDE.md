@@ -1,4 +1,4 @@
-# CLAUDE.md — passforge
+# CLAUDE.md — WebAuthn
 
 Developer guide for this codebase. Start here every session.
 
@@ -6,7 +6,7 @@ Developer guide for this codebase. Start here every session.
 
 ## Project overview
 
-**passforge** is a WebAuthn relying-party library written in Rust. It implements
+This is a **WebAuthn relying-party library** written in Rust. It implements
 the server-side verification logic for the two core WebAuthn ceremonies:
 
 - **Registration** (`navigator.credentials.create`) — the authenticator generates
@@ -380,7 +380,7 @@ The `docs-sync` hook prints warnings when files with broad impact are edited:
 
 ### Why spec compliance comments matter
 
-passforge is a security library. The WebAuthn spec defines exact algorithms
+This is a security library. The WebAuthn spec defines exact algorithms
 for registration and authentication — implementing a step incorrectly or
 skipping it can introduce authentication bypasses. Step comments (`// §7.1 step 8`)
 serve as an audit trail: a reviewer can open the spec and the source file

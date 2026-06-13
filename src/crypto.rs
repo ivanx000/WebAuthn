@@ -1,4 +1,4 @@
-//! Low-level cryptographic primitives used throughout the ceremony verification code.
+//! Low-level cryptographic primitives used throughout WebAuthn ceremony verification.
 //!
 //! All cryptographic operations are delegated to [`ring`], which is a carefully
 //! audited, FIPS-aligned library descended from BoringSSL. No custom crypto is

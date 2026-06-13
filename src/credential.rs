@@ -145,6 +145,10 @@ pub struct AuthenticationResult {
     /// Update the stored credential's `sign_count` to this value after success.
     pub new_sign_count: u32,
 
+    /// Whether the User Present (UP) flag was set — the authenticator confirmed
+    /// that a human was at the device (button press, touch, etc.).
+    pub user_present: bool,
+
     /// Whether the authenticator signalled that the user was verified
     /// (biometric check, PIN, etc.) — corresponds to the UV flag.
     pub user_verified: bool,

@@ -50,7 +50,7 @@ impl RelyingParty {
     /// * `response`          — The assertion response from the authenticator.
     ///
     /// # Errors
-    /// Returns a [`PassforgeError`] variant indicating exactly which
+    /// Returns a [`crate::error::PassforgeError`] variant indicating exactly which
     /// verification step failed, including `SignCountInvalid` for suspected
     /// authenticator clones.
     pub fn verify_authentication(
@@ -153,6 +153,7 @@ fn verify_authentication_inner(
     Ok(AuthenticationResult {
         credential_id: stored_credential.id.clone(),
         new_sign_count: received,
+        user_present: auth_data.flags.user_present,
         user_verified: auth_data.flags.user_verified,
     })
 }

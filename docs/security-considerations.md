@@ -1,6 +1,6 @@
 # Security Considerations
 
-Detailed security notes for implementers using passforge.
+Detailed security notes for implementers using this WebAuthn library.
 
 ---
 
@@ -13,11 +13,11 @@ The challenge is the relying party's proof that a ceremony response was produced
 can pre-compute or replay a valid signature.
 
 **Requirements:**
-- At least 128 bits of entropy (passforge uses 256 bits — 32 bytes from the OS CSPRNG)
+- At least 128 bits of entropy (this library uses 256 bits — 32 bytes from the OS CSPRNG)
 - Generated fresh for every ceremony, never reused
 - Destroyed after a single use (the relying party must enforce this)
 
-passforge generates challenges via `ring::rand::SystemRandom`, which reads from
+Challenges are generated via `ring::rand::SystemRandom`, which reads from
 `/dev/urandom` on Linux/macOS and `BCryptGenRandom` on Windows. These are
 cryptographically secure and cannot be predicted by an attacker.
 
@@ -27,18 +27,18 @@ A captured challenge + response could be replayed to authenticate without the
 authenticator. If the same challenge is accepted more than once, a man-in-the-middle
 who observed one authentication can impersonate the user in a second session.
 
-**passforge does not enforce single-use** — this is the caller's responsibility.
+**This library does not enforce single-use** — this is the caller's responsibility.
 After calling `verify_registration` or `verify_authentication`, mark the challenge
 as consumed in your session store and reject any future presentation of it.
 
 ### Challenge expiry
 
-passforge provides `passforge::challenge::is_expired()` which checks a 5-minute
+This library provides `webauthn::challenge::is_expired()` which checks a 5-minute
 window. Long-lived challenges give attackers more time to observe and replay. The
 5-minute default is conservative; a 60-second window is common in production.
 
 ```rust
-if passforge::challenge::is_expired(&challenge) {
+if webauthn::challenge::is_expired(&challenge) {
     return Err("challenge expired");
 }
 ```
@@ -55,7 +55,7 @@ running a WebAuthn ceremony will produce a response with `origin: "https://evil.
 If the relying party at `https://bank.com` does not check the origin, that
 response could be used to authenticate there.
 
-passforge compares `client_data.origin == expected_origin` as an exact byte
+This library compares `client_data.origin == expected_origin` as an exact byte
 comparison. There is no fuzzy matching, subdomain allowlisting, or wildcards.
 The caller must supply the exact origin (scheme + host + port) that should be accepted.
 
@@ -75,7 +75,7 @@ authenticator data blob from a *different* RP — one they control — with a va
 signature, but where the public key matches a credential registered to the victim
 site. This attack is stopped by the RP ID hash check.
 
-passforge verifies `auth_data.rp_id_hash == SHA-256(rp_id)` on every ceremony.
+This library verifies `auth_data.rp_id_hash == SHA-256(rp_id)` on every ceremony.
 
 ---
 
@@ -92,21 +92,31 @@ one device and installs it on another, both devices will produce signatures from
 same counter starting point. When the cloned device's count is lower than the
 legitimate device's count (or vice versa), the relying party sees a violation.
 
-**passforge's check (§7.2 step 25):**
+**This library's check (§7.2 step 25):**
 ```
 if received != 0 && received <= stored {
     return Err(SignCountInvalid { stored, received });
 }
 ```
 
-### Limitations of sign count
+### Why both-zero is a valid state
 
-The sign count mechanism has well-known limitations:
+The WebAuthn spec permits authenticators to not implement a sign counter. These
+authenticators always report a sign count of zero. A received count of zero when
+the stored count is also zero means the authenticator simply does not support
+counters — the library accepts this case per spec requirement. Clone detection is
+not available for these authenticators.
+
+Platform passkeys (iCloud Keychain, Google Password Manager) typically set the
+counter to zero because the private key is synced across multiple devices — a
+per-device counter would be meaningless. This is expected behavior, not a defect.
+
+### Limitations of sign count
 
 **Synced credentials (passkeys)** — when a private key is synced across devices via
 iCloud Keychain or Google Password Manager, all devices share the key but may not
 share the counter. Platforms typically set the counter to 0 for synced credentials.
-passforge accepts count 0 (spec requirement) but this means clone detection is not
+This library accepts count 0 (spec requirement) but this means clone detection is not
 available for synced passkeys.
 
 **Non-monotonic increments** — the spec allows the count to increase by more than 1
@@ -130,11 +140,52 @@ legitimate app bug or platform sync issue. The recommended response:
 
 ---
 
+## User Verification (UV) flag
+
+### What UV means
+
+The User Verification (UV) flag indicates that the authenticator performed a
+verification step beyond simple presence — for example, a biometric check (Touch ID,
+Face ID) or a PIN entry. It does not mean the user typed a password.
+
+### Why this library does not enforce UV by default
+
+The WebAuthn spec (§7.2 step 21) states that UV enforcement is optional and
+application-specific. Some applications (e.g. low-risk account actions) only need
+User Presence; others (e.g. payment authorization, sensitive settings) need User
+Verification. Enforcing UV inside the library would be too opinionated.
+
+Instead, `AuthenticationResult` exposes `user_verified: bool`. The caller decides
+whether to require it for their threat model:
+
+```rust
+let result = rp.verify_authentication(&credential, &challenge, &response)?;
+if requires_uv && !result.user_verified {
+    return Err("user verification required for this action");
+}
+```
+
+---
+
+## What the caller is responsible for
+
+| Property | Notes |
+|----------|-------|
+| Challenge single-use | Mark challenge as consumed in your session store after use |
+| Challenge storage | Store server-side; never trust the client to return the challenge |
+| Credential lookup | Look up stored credential by credential ID before calling verify |
+| Sign count update | Write `auth_result.new_sign_count` to your database after success |
+| UV enforcement | Check `auth_result.user_verified` if your flow requires it |
+| HTTPS enforcement | WebAuthn ceremonies only work in secure contexts |
+| Attestation trust | Only `"none"` attestation is verified; device provenance is unverified |
+
+---
+
 ## What this library does NOT protect against
 
 ### Full attestation chain
 
-passforge only accepts the `"none"` attestation format. This means you cannot verify:
+This library only accepts the `"none"` attestation format. This means you cannot verify:
 - That the authenticator is genuine hardware (not a software emulator)
 - The authenticator model or firmware version
 - Whether the device has been compromised at the hardware level
@@ -147,19 +198,19 @@ implement `"packed"` attestation and validate the certificate chain against the
 
 The `tokenBinding` field in `clientDataJSON` is ignored. Token binding cryptographically
 ties a session to a TLS channel, preventing token theft. It is rarely implemented and
-has been removed from most browsers, but if you need it, passforge does not provide it.
+has been removed from most browsers, but if you need it, this library does not provide it.
 
 ### Side-channel attacks
 
-passforge uses `ring` for signature verification, which provides constant-time
-ECDSA operations. However, passforge itself does not guarantee constant-time
+This library uses `ring` for signature verification, which provides constant-time
+ECDSA operations. However, the library itself does not guarantee constant-time
 credential lookups, error responses, or JSON parsing. A timing attacker observing
 response latency might infer whether a credential ID was found in the database.
 Use constant-time credential ID comparison if this is a concern.
 
 ### Credential storage security
 
-passforge returns a `Credential` struct containing the public key. The caller must
+This library returns a `Credential` struct containing the public key. The caller must
 store it securely. Public keys are not secret, but credential IDs can be used to
 determine which users are registered, so treat the credential table as sensitive:
 
@@ -174,14 +225,15 @@ determine which users are registered, so treat the credential table as sensitive
 
 | Property | Enforced by | Notes |
 |----------|-------------|-------|
-| Challenge randomness | passforge (`ring` CSPRNG) | 256 bits entropy |
+| Challenge randomness | Library (`ring` CSPRNG) | 256 bits entropy |
 | Challenge single-use | **Caller** | Must invalidate after use |
 | Challenge expiry | Caller via `is_expired()` | Default 5 min |
-| Origin binding | passforge | Exact string match |
-| RP ID binding | passforge | SHA-256 comparison |
-| User presence | passforge | UP flag check |
-| Signature validity | passforge (`ring` ECDSA) | Constant-time |
-| Sign count monotonicity | passforge | Non-zero counts only |
+| Origin binding | Library | Exact string match |
+| RP ID binding | Library | SHA-256 comparison |
+| User presence | Library | UP flag check |
+| Signature validity | Library (`ring` ECDSA) | Constant-time |
+| Sign count monotonicity | Library | Non-zero counts only |
+| User verification | **Caller** | Check `user_verified` if required |
 | HTTPS enforcement | **Caller** / infrastructure | Browsers require it |
-| Attestation trust | **Caller** | passforge only validates "none" |
+| Attestation trust | **Caller** | Library only validates "none" |
 | Credential storage | **Caller** | Treat as sensitive data |

@@ -1,6 +1,6 @@
 # /add-algorithm
 
-Scaffold support for a new COSE algorithm in passforge (e.g. RS256, EdDSA).
+Scaffold support for a new COSE algorithm in webauthn (e.g. RS256, EdDSA).
 
 ## Steps
 

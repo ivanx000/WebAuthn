@@ -1,11 +1,11 @@
-//! Error types for the passforge library.
+//! Error types for the webauthn library.
 //!
 //! Every variant produces a message that aids debugging without leaking
 //! security-sensitive material (key bytes, challenge values, etc.).
 
 use thiserror::Error;
 
-/// All errors that can be returned by passforge ceremony verification.
+/// All errors that can be returned by WebAuthn ceremony verification.
 #[derive(Debug, Error)]
 pub enum PassforgeError {
     /// The client data JSON could not be decoded or is structurally invalid.
@@ -80,5 +80,5 @@ pub enum PassforgeError {
     UnsupportedAlgorithm(i64),
 }
 
-/// Convenience alias so callers write `passforge::Result<T>`.
+/// Convenience alias so callers write `webauthn::Result<T>`.
 pub type Result<T> = std::result::Result<T, PassforgeError>;

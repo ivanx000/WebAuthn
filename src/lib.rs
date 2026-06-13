@@ -1,6 +1,6 @@
-//! # passforge — WebAuthn / Passkey relying-party library
+//! # webauthn — WebAuthn relying-party library
 //!
-//! passforge implements the server-side (relying party) logic for the two core
+//! Implements the server-side (relying party) logic for the two core
 //! WebAuthn ceremonies:
 //!
 //! - **Registration** — the authenticator generates a keypair and the relying
@@ -17,8 +17,8 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use passforge::{RelyingParty, AuthenticatorAttestationResponse};
-//! use passforge::Challenge;
+//! use webauthn::{RelyingParty, AuthenticatorAttestationResponse};
+//! use webauthn::Challenge;
 //!
 //! // 1. Configure the relying party once, at startup.
 //! let rp = RelyingParty::new("example.com", "https://example.com", "My Service");
