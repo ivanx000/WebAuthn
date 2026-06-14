@@ -338,16 +338,14 @@ automation during AI-assisted development. All hooks are in `.claude/scripts/`.
 | docs-sync | PostToolUse | Specific `src/` files edited | Prints a targeted warning reminding Claude to check related docs |
 | test-runner | PostToolUse | Any file in `src/` or `tests/` edited | Runs `cargo test`; prints ✅ or ❌ |
 | log-command | PreToolUse | Every Bash command | Appends `[timestamp] command` to `.claude/logs/commands.log` |
-| auto-commit | Stop | Claude's turn ends | Stages all changes, generates a conventional commit message, commits locally |
+| auto-commit | Stop | *(disabled)* | Script kept at `.claude/scripts/auto-commit.sh` but hook removed — commits are made manually per logical change |
 
-### Why git push is intentionally manual
+### Why commits are manual
 
-The auto-commit hook commits to the local repo only. `git push` is never
-automated because:
-
-1. Pushing triggers CI and notifies collaborators — a deliberate decision, not a side effect.
-2. Automated pushes during development create a noisy commit history on the remote.
-3. The developer should review the commit message before publishing.
+The auto-commit Stop hook has been disabled. Commits are made explicitly during
+a turn, one per logical change, with specific conventional commit messages. This
+gives a meaningful git history instead of one catch-all "update WebAuthn (N
+files changed)" commit per Claude turn.
 
 To push when you're ready: `git push`.
 
