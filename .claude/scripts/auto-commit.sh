@@ -33,7 +33,7 @@ elif [[ $HAS_CFG  -gt 0 ]]; then PREFIX="chore"
 fi
 
 N=$(echo "$STAGED" | grep -c . 2>/dev/null || echo "0")
-MSG="${PREFIX}: update passforge (${N} file(s) changed)"
+MSG="${PREFIX}: update WebAuthn (${N} file(s) changed)"
 
 git commit -m "$MSG
 
