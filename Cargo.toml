@@ -1,12 +1,20 @@
 [package]
-name = "webauthn"
+name = "webauthn-rs-demo"
 version = "0.1.0"
 edition = "2021"
-description = "WebAuthn relying-party library — server-side registration and authentication ceremonies"
-keywords = ["webauthn", "passkey", "fido2", "authentication", "cryptography"]
-categories = ["authentication", "cryptography"]
-license = "MIT"
+rust-version = "1.70"
+description = "Server-side WebAuthn/Passkey library implementing the W3C WebAuthn Level 2 specification"
+keywords = ["webauthn", "passkey", "fido", "authentication", "security"]
+categories = ["authentication", "cryptography", "web-programming"]
+license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/ivanxie/WebAuthn"
+documentation = "https://docs.rs/webauthn-rs-demo"
+
+[lib]
+# Keep the Rust crate name as `webauthn` so existing code and examples import
+# `use webauthn::...` while the crates.io package name is `webauthn-rs-demo`.
+name = "webauthn"
 
 [dependencies]
 # Cryptography: ECDSA P-256, SHA-256, secure random
