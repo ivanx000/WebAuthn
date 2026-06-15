@@ -1,6 +1,6 @@
 # /check
 
-Run the full WebAuthn quality suite and report results.
+Run the full WebAuthn quality suite, mirroring CI exactly, and report results.
 
 ## Steps
 
@@ -11,19 +11,29 @@ Run each check sequentially and collect pass/fail status:
    cargo build
    ```
 
-2. **Clippy**
+2. **Format**
+   ```
+   cargo fmt --check
+   ```
+
+3. **Clippy**
    ```
    cargo clippy -- -D warnings
    ```
 
-3. **Tests**
+4. **Tests**
    ```
    cargo test
    ```
 
-4. **Format**
+5. **Doc check**
    ```
-   cargo fmt --check
+   cargo doc --no-deps 2>&1 | grep "^error" && exit 1 || true
+   ```
+
+6. **Demo**
+   ```
+   cargo run --example demo
    ```
 
 ## Output format
@@ -32,10 +42,12 @@ After all checks complete, print a summary table:
 
 ```
 === WebAuthn quality check ===
-✅ cargo build
-✅ cargo clippy (zero warnings)
-✅ cargo test   (N tests passed)
-✅ cargo fmt    (no formatting issues)
+✅ build
+✅ fmt
+✅ clippy
+✅ test
+✅ doc
+✅ demo
 ================================
 All checks passed.
 ```
@@ -44,10 +56,12 @@ Or if any fail:
 
 ```
 === WebAuthn quality check ===
-✅ cargo build
-❌ cargo clippy — N warnings found
-✅ cargo test   (N tests passed)
-❌ cargo fmt    — run `cargo fmt` to fix
+✅ build
+❌ fmt    — run `cargo fmt` to fix
+✅ clippy
+✅ test
+✅ doc
+❌ demo   — see output above
 ================================
 2 checks failed.
 ```
