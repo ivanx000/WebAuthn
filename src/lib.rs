@@ -1,3 +1,8 @@
+// Safety: This library handles security-critical operations. Unsafe code
+// is forbidden to eliminate entire classes of memory safety vulnerabilities.
+// All cryptographic operations are delegated to the `ring` crate which
+// manages its own unsafe code behind a safe API.
+#![forbid(unsafe_code)]
 // Security libraries must not panic on any input — a panic in a security
 // check aborts the ceremony rather than returning a typed error, potentially
 // allowing callers to misinterpret the outcome. Use ? and explicit error
