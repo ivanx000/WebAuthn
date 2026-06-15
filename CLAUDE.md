@@ -529,3 +529,70 @@ added as dev-dependencies.
 3. `cargo package --no-verify` to verify the .crate file.
 4. `git tag v<version> && git push --tags`.
 5. `cargo publish` (requires `cargo login` with crates.io token first).
+
+---
+
+## CI & Quality
+
+### Pipeline overview
+
+GitHub Actions runs `.github/workflows/ci.yml` on every push and pull request to `main`.
+Three jobs run in parallel:
+
+| Job | What it runs |
+|-----|-------------|
+| **Build & Test** | `cargo build`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo doc --no-deps`, `cargo run --example demo` |
+| **MSRV (1.70)** | `cargo build` + `cargo test` on Rust 1.70 |
+| **Security Audit** | `cargo audit` via `cargo-audit` |
+
+### Always run `cargo fmt` before committing
+
+The CI `fmt --check` step fails on any unformatted file. Run `cargo fmt` locally before
+every commit to avoid a red CI build. The `/check` command does this for you.
+
+### Running the full CI suite locally
+
+Use `/check` or run manually in this order (same as CI):
+
+```bash
+cargo build
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
+cargo doc --no-deps 2>&1 | grep "^error" && exit 1 || true
+cargo run --example demo
+```
+
+All six must pass before pushing.
+
+### MSRV — Minimum Supported Rust Version (1.70)
+
+`rust-version = "1.70"` in `Cargo.toml` declares that the crate compiles on Rust 1.70.
+The MSRV job on CI enforces this by building and testing on that exact toolchain.
+1.70 was chosen because it is the oldest stable release that supports all features used
+in this crate (notably `let-else` and `is_some_and`). Bump the MSRV intentionally when
+adopting a newer language feature, and update `Cargo.toml`, `CLAUDE.md`, and the CI job.
+
+### cargo-audit — dependency vulnerability scanning
+
+`cargo audit` checks every dependency in `Cargo.lock` against the
+[RustSec Advisory Database](https://rustsec.org/). It fails the build if any dependency
+has a known CVE or security advisory. The security-audit CI job installs `cargo-audit`
+with `--locked` to get a reproducible version.
+
+To run locally (requires `cargo install cargo-audit`):
+```bash
+cargo audit
+```
+
+If audit fails on CI, check the advisory at `rustsec.org/advisories/<ID>` and either:
+- Upgrade the affected dependency to a patched version, or
+- Add a `[patch]` or `[dependencies]` version bump in `Cargo.toml`.
+
+### Fixing a failing CI build
+
+1. Check the failing job in the GitHub Actions tab.
+2. Reproduce locally with the command from the table above.
+3. Fix the issue, run `/check` to confirm all six steps pass, then push.
+4. For MSRV failures: the code uses a feature not available in Rust 1.70 — rewrite to avoid it.
+5. For audit failures: upgrade the flagged dependency or open an issue to track it.
