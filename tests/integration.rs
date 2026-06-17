@@ -1309,6 +1309,202 @@ fn rs256_rejects_signature_over_wrong_message() {
     assert!(matches!(err, WebAuthnError::SignatureVerificationFailed));
 }
 
+// ─── EdDSA (Ed25519) tests ────────────────────────────────────────────────────
+
+struct EdDsaFixture {
+    key_pair: ring::signature::Ed25519KeyPair,
+    cred_id: Vec<u8>,
+    public_key_bytes: Vec<u8>, // 32-byte raw Ed25519 public key
+}
+
+impl EdDsaFixture {
+    fn new() -> Self {
+        use ring::signature::Ed25519KeyPair;
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key_bytes = key_pair.public_key().as_ref().to_vec();
+        Self {
+            key_pair,
+            cred_id: vec![0xEFu8; 16],
+            public_key_bytes,
+        }
+    }
+
+    fn make_registration_response(
+        &self,
+        challenge: &[u8],
+        origin: &str,
+        rp_id: &str,
+        flags: u8,
+        sign_count: u32,
+    ) -> AuthenticatorAttestationResponse {
+        let client_data_json = make_client_data_json_bytes("webauthn.create", challenge, origin);
+        let cose_key = encode_eddsa_cose_key(&self.public_key_bytes);
+        let auth_data =
+            make_authenticator_data_raw(rp_id, flags, sign_count, Some((&self.cred_id, &cose_key)));
+        let att_obj = make_attestation_object(&auth_data, "none");
+        AuthenticatorAttestationResponse {
+            client_data_json,
+            attestation_object: att_obj,
+        }
+    }
+
+    fn make_auth_response(
+        &self,
+        challenge: &[u8],
+        origin: &str,
+        rp_id: &str,
+        sign_count: u32,
+    ) -> AuthenticatorAssertionResponse {
+        let client_data_bytes = make_client_data_json_bytes("webauthn.get", challenge, origin);
+        let auth_data = make_authenticator_data_raw(rp_id, 0x01, sign_count, None);
+        let client_data_hash = webauthn::crypto::sha256(&client_data_bytes);
+        let mut signed_data = auth_data.clone();
+        signed_data.extend_from_slice(&client_data_hash);
+        let sig = self.key_pair.sign(&signed_data);
+        AuthenticatorAssertionResponse {
+            client_data_json: client_data_bytes,
+            authenticator_data: auth_data,
+            signature: sig.as_ref().to_vec(),
+            user_handle: None,
+        }
+    }
+}
+
+fn encode_eddsa_cose_key(public_key: &[u8]) -> Vec<u8> {
+    let cose = Value::Map(vec![
+        (Value::Integer(1i64.into()), Value::Integer(1i64.into())),    // kty: OKP
+        (Value::Integer(3i64.into()), Value::Integer((-8i64).into())), // alg: EdDSA
+        (Value::Integer((-1i64).into()), Value::Integer(6i64.into())), // crv: Ed25519
+        (
+            Value::Integer((-2i64).into()),
+            Value::Bytes(public_key.to_vec()),
+        ), // x: raw public key
+    ]);
+    let mut buf = Vec::new();
+    ciborium::into_writer(&cose, &mut buf).unwrap();
+    buf
+}
+
+#[test]
+fn eddsa_full_registration_and_authentication_flow() {
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
+    let fixture = EdDsaFixture::new();
+
+    // Registration
+    let reg_challenge = Challenge::new().unwrap();
+    let response =
+        fixture.make_registration_response(&reg_challenge.bytes, ORIGIN, RP_ID, 0x41, 0);
+    let reg_result = rp
+        .verify_registration(&reg_challenge, &response, b"eddsa-user")
+        .expect("EdDSA registration should succeed");
+
+    assert_eq!(reg_result.credential.sign_count, 0);
+    assert_eq!(reg_result.credential.rp_id, RP_ID);
+    assert!(matches!(
+        reg_result.credential.public_key,
+        webauthn::PublicKey::EdDSA(_)
+    ));
+
+    // Authentication
+    let mut credential = reg_result.credential;
+    let auth_challenge = Challenge::new().unwrap();
+    let auth_response = fixture.make_auth_response(&auth_challenge.bytes, ORIGIN, RP_ID, 1);
+    let auth_result = rp
+        .verify_authentication(&credential, &auth_challenge, &auth_response)
+        .expect("EdDSA authentication should succeed");
+
+    assert_eq!(auth_result.new_sign_count, 1);
+    assert!(auth_result.user_present);
+    credential.sign_count = auth_result.new_sign_count;
+    assert_eq!(credential.sign_count, 1);
+}
+
+#[test]
+fn eddsa_rejects_tampered_signature() {
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
+    let fixture = EdDsaFixture::new();
+
+    let reg_challenge = Challenge::new().unwrap();
+    let response =
+        fixture.make_registration_response(&reg_challenge.bytes, ORIGIN, RP_ID, 0x41, 0);
+    let credential = rp
+        .verify_registration(&reg_challenge, &response, b"uid")
+        .unwrap()
+        .credential;
+
+    let ch = Challenge::new().unwrap();
+    let mut auth_response = fixture.make_auth_response(&ch.bytes, ORIGIN, RP_ID, 1);
+    auth_response.signature[10] ^= 0xFF;
+
+    let err = rp
+        .verify_authentication(&credential, &ch, &auth_response)
+        .unwrap_err();
+    assert!(matches!(err, WebAuthnError::SignatureVerificationFailed));
+}
+
+#[test]
+fn eddsa_rejects_replay_attack() {
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
+    let fixture = EdDsaFixture::new();
+
+    let reg_challenge = Challenge::new().unwrap();
+    let response =
+        fixture.make_registration_response(&reg_challenge.bytes, ORIGIN, RP_ID, 0x41, 0);
+    let mut credential = rp
+        .verify_registration(&reg_challenge, &response, b"uid")
+        .unwrap()
+        .credential;
+
+    let ch1 = Challenge::new().unwrap();
+    let r1 = fixture.make_auth_response(&ch1.bytes, ORIGIN, RP_ID, 1);
+    credential.sign_count = rp
+        .verify_authentication(&credential, &ch1, &r1)
+        .unwrap()
+        .new_sign_count;
+
+    let ch2 = Challenge::new().unwrap();
+    let r2 = fixture.make_auth_response(&ch2.bytes, ORIGIN, RP_ID, 1);
+    let err = rp
+        .verify_authentication(&credential, &ch2, &r2)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        WebAuthnError::SignCountInvalid {
+            stored: 1,
+            received: 1
+        }
+    ));
+}
+
+#[test]
+fn eddsa_rejects_signature_over_wrong_message() {
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
+    let fixture = EdDsaFixture::new();
+
+    let reg_challenge = Challenge::new().unwrap();
+    let response =
+        fixture.make_registration_response(&reg_challenge.bytes, ORIGIN, RP_ID, 0x41, 0);
+    let credential = rp
+        .verify_registration(&reg_challenge, &response, b"uid")
+        .unwrap()
+        .credential;
+
+    let ch1 = Challenge::new().unwrap();
+    let ch2 = Challenge::new().unwrap();
+
+    // Sign ch1 but present with ch2 verification context.
+    let response_ch1 = fixture.make_auth_response(&ch1.bytes, ORIGIN, RP_ID, 1);
+    let mut response_ch2 = fixture.make_auth_response(&ch2.bytes, ORIGIN, RP_ID, 1);
+    response_ch2.signature = response_ch1.signature;
+
+    let err = rp
+        .verify_authentication(&credential, &ch2, &response_ch2)
+        .unwrap_err();
+    assert!(matches!(err, WebAuthnError::SignatureVerificationFailed));
+}
+
 // ─── No-panic fuzz tests ──────────────────────────────────────────────────────
 
 #[test]
