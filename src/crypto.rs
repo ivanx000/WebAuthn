@@ -62,6 +62,25 @@ pub fn verify_es256(
         .map_err(|_| WebAuthnError::SignatureVerificationFailed)
 }
 
+/// Verify an EdDSA (Ed25519) signature.
+///
+/// # Arguments
+/// * `public_key` — Raw 32-byte Ed25519 public key, as stored in COSE OKP key
+///   parameter `-2` (`x`). Ed25519 keys are always exactly 32 bytes.
+/// * `message`    — The raw message that was signed. Ed25519 processes the
+///   message internally (via SHA-512 internally in ring); do not pre-hash.
+/// * `signature`  — Raw 64-byte Ed25519 signature. Unlike ECDSA, Ed25519
+///   signatures are a fixed-length raw encoding, not DER.
+///
+/// # Errors
+/// Returns [`WebAuthnError::SignatureVerificationFailed`] if the signature is
+/// invalid, the key is not 32 bytes, or the signature is not 64 bytes.
+pub fn verify_eddsa(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<()> {
+    let key = UnparsedPublicKey::new(&signature::ED25519, public_key);
+    key.verify(message, signature)
+        .map_err(|_| WebAuthnError::SignatureVerificationFailed)
+}
+
 /// Verify an RS256 (RSA PKCS#1 v1.5 + SHA-256) signature.
 ///
 /// # Arguments
@@ -195,6 +214,59 @@ mod tests {
         let pk = kp.public_key().as_ref();
 
         let err = verify_es256(pk, b"hello", &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap_err();
+        assert!(matches!(err, WebAuthnError::SignatureVerificationFailed));
+    }
+
+    // ── verify_eddsa ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn verify_eddsa_accepts_valid_signature() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pk = kp.public_key().as_ref();
+
+        let msg = b"test message for EdDSA verification";
+        let sig = kp.sign(msg);
+        verify_eddsa(pk, msg, sig.as_ref()).expect("valid EdDSA signature should verify");
+    }
+
+    #[test]
+    fn verify_eddsa_rejects_wrong_message() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pk = kp.public_key().as_ref();
+
+        let sig = kp.sign(b"message A");
+        let err = verify_eddsa(pk, b"message B", sig.as_ref()).unwrap_err();
+        assert!(matches!(err, WebAuthnError::SignatureVerificationFailed));
+    }
+
+    #[test]
+    fn verify_eddsa_rejects_empty_key() {
+        let err = verify_eddsa(&[], b"msg", &[0u8; 64]).unwrap_err();
+        assert!(matches!(err, WebAuthnError::SignatureVerificationFailed));
+    }
+
+    #[test]
+    fn verify_eddsa_rejects_tampered_signature() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pk = kp.public_key().as_ref();
+
+        let msg = b"test message";
+        let sig = kp.sign(msg);
+        let mut sig_bytes = sig.as_ref().to_vec();
+        sig_bytes[10] ^= 0xFF;
+        let err = verify_eddsa(pk, msg, &sig_bytes).unwrap_err();
         assert!(matches!(err, WebAuthnError::SignatureVerificationFailed));
     }
 
