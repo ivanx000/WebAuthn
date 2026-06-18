@@ -265,8 +265,8 @@ Canonical spec: https://www.w3.org/TR/webauthn-3/
 
 | Limitation | Notes |
 |------------|-------|
-| EdDSA / Ed25519 | Not supported; would require `ring` Ed25519 verify path |
 | Packed basic attestation cert chain | `x5c` detected, `AttestationType::Basic` returned; chain not verified (no MDS) |
+| FIDO U2F cert chain | `x5c` signature verified, cert chain not verified (no MDS trust anchors) |
 | `"tpm"` / `"android-key"` attestation | Not implemented |
 | Extension data ignored | The extensions section of authenticator data is parsed but silently skipped |
 | `crossOrigin: true` accepted | Some RPs should reject cross-origin requests; currently allowed |
@@ -478,7 +478,9 @@ crate. All security-critical operations remain inside `ring`'s audited boundary.
   `verify_rs256`. Returns `AttestationType::SelfAttestation`.
 - **Basic attestation** (`x5c` present): detected and returns `AttestationType::Basic`.
   Certificate chain is not verified — no FIDO MDS trust anchor set available.
-- Other formats (`"fido-u2f"`, `"tpm"`, etc.): accepted with `AttestationType::None`
+- **FIDO U2F** (`"fido-u2f"`): signature verified against the attestation cert's
+  EC P-256 public key. Returns `AttestationType::Basic`. Certificate chain not verified.
+- Other formats (`"tpm"`, `"android-key"`, etc.): accepted with `AttestationType::None`
   (provenance unverifiable but credential usable).
 
 `parse_attestation_object` in `registration.rs` was updated to return the `attStmt`

@@ -49,9 +49,9 @@ worthless without private keys), and password reuse (each site gets a unique key
 | `#![forbid(unsafe_code)]` | ✅ Enforced at compile time |
 | No-panic guarantee on adversarial input | ✅ `#![deny(clippy::unwrap_used)]` |
 | Fixed test vectors (registration + authentication) | ✅ Implemented |
-| FIDO U2F attestation | ❌ Not implemented |
+| FIDO U2F attestation | ✅ Implemented — signature verified; cert chain requires FIDO MDS |
 | TPM attestation | ❌ Not implemented |
-| EdDSA / Ed25519 | ❌ Not implemented |
+| EdDSA / Ed25519 | ✅ Implemented |
 | Token binding | ❌ Not implemented |
 | FIDO Metadata Service (MDS) lookup | ❌ Not implemented |
 
