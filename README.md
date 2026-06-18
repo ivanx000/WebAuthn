@@ -44,14 +44,15 @@ worthless without private keys), and password reuse (each site gets a unique key
 | `"none"` attestation format | ✅ Implemented |
 | Packed self-attestation (no x5c) | ✅ Implemented — signature fully verified |
 | Packed basic attestation (x5c present) | ⚠️ Detected, certificate chain not verified |
+| FIDO U2F attestation (`"fido-u2f"`) | ✅ Implemented — signature verified; cert chain requires FIDO MDS |
+| Android Key attestation (`"android-key"`) | ✅ Implemented — signature + key-match verified; cert chain requires FIDO MDS |
 | Sign-count replay attack detection | ✅ Implemented |
 | Challenge generation (32-byte CSPRNG) | ✅ Implemented |
 | `#![forbid(unsafe_code)]` | ✅ Enforced at compile time |
 | No-panic guarantee on adversarial input | ✅ `#![deny(clippy::unwrap_used)]` |
 | Fixed test vectors (registration + authentication) | ✅ Implemented |
-| FIDO U2F attestation | ✅ Implemented — signature verified; cert chain requires FIDO MDS |
-| TPM attestation | ❌ Not implemented |
 | EdDSA / Ed25519 | ✅ Implemented |
+| TPM attestation | ❌ Not implemented |
 | Token binding | ❌ Not implemented |
 | FIDO Metadata Service (MDS) lookup | ❌ Not implemented |
 
@@ -157,7 +158,7 @@ curl -s -X POST http://localhost:3000/authenticate/begin \
 ## Running tests
 
 ```bash
-cargo test                        # all 148+ unit + integration + doc tests
+cargo test                        # all 168+ unit + integration + doc tests
 cargo clippy -- -D warnings       # lint (zero-warning policy)
 cargo fmt --check                 # formatting
 cargo doc --no-deps               # API docs (zero warnings)
@@ -207,9 +208,11 @@ cargo package --dry-run           # crates.io readiness check
 
 ### What this library does NOT protect against
 
-- **Full attestation chain** — only `"none"` attestation is verified. Unverified
-  attestation means you cannot distinguish genuine authenticators from software
-  emulators.
+- **Full attestation chain** — `"none"`, `"packed"` (self-attestation), `"fido-u2f"`,
+  and `"android-key"` are verified (signature and key-match checks). Certificate chain
+  validation against the FIDO Metadata Service is not implemented for any format, so
+  device provenance — distinguishing genuine hardware from a software emulator — cannot
+  be fully confirmed.
 - **Token binding** — `tokenBinding` in `clientDataJSON` is ignored.
 - **Cloned authenticators with zero counters** — if `sign_count == 0` the spec
   allows accepting the assertion (the authenticator simply doesn't count). Clone

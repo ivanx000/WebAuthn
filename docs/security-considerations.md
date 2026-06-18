@@ -94,10 +94,15 @@ legitimate device's count (or vice versa), the relying party sees a violation.
 
 **This library's check (§7.2 step 25):**
 ```
-if received != 0 && received <= stored {
+if (stored > 0 || received > 0) && received <= stored {
     return Err(SignCountInvalid { stored, received });
 }
 ```
+
+The `stored > 0 || received > 0` guard means: if both counters are zero the check is
+skipped (authenticator without a counter). If either is non-zero and received ≤ stored,
+the assertion is rejected — this catches the wrap-around case (received = 0 when
+stored > 0) that an older `received != 0` guard would miss.
 
 ### Why both-zero is a valid state
 
@@ -185,14 +190,18 @@ if requires_uv && !result.user_verified {
 
 ### Full attestation chain
 
-This library only accepts the `"none"` attestation format. This means you cannot verify:
-- That the authenticator is genuine hardware (not a software emulator)
-- The authenticator model or firmware version
-- Whether the device has been compromised at the hardware level
+This library verifies attestation signatures for `"none"`, `"packed"`,
+`"fido-u2f"`, and `"android-key"` formats. However, it does **not** validate
+attestation certificate chains against the FIDO Metadata Service (MDS). This means:
+- Attestation signatures are checked (the cert's key signed the data)
+- But you cannot confirm the cert was issued by a genuine manufacturer root
+- A software authenticator could present a self-signed cert and pass signature checks
+- The authenticator model, firmware version, and hardware provenance are unverifiable
 
 For applications where device provenance matters (banking, government, enterprise),
-implement `"packed"` attestation and validate the certificate chain against the
-[FIDO Metadata Service (MDS)](https://fidoalliance.org/metadata/).
+validate the certificate chain against the
+[FIDO Metadata Service (MDS)](https://fidoalliance.org/metadata/) after signature
+verification.
 
 ### Token binding
 
@@ -285,21 +294,25 @@ This library follows these rules:
 
 ### Attestation verification scope
 
-This library verifies the `"none"` attestation format only. Any other format
-(packed, tpm, fido-u2f, android-key, apple) is rejected with an explicit error.
+This library verifies the following attestation formats:
 
-**What "none" attestation means:** the authenticator does not provide a
-certificate chain linking it to a known manufacturer. Registration still
-succeeds, and the public key is stored. But you cannot verify:
-- That the key was generated inside genuine FIDO2 hardware
-- The authenticator model or firmware version
+| Format | What is verified | What is NOT verified |
+|--------|-----------------|----------------------|
+| `"none"` | (no attestation provided) | — |
+| `"packed"` (self) | Signature using the credential key | — |
+| `"packed"` (basic, x5c present) | x5c presence detected | Cert chain against FIDO MDS |
+| `"fido-u2f"` | ECDSA-P256 signature over U2F verification data | Cert chain against FIDO MDS |
+| `"android-key"` | ECDSA-P256 signature; cert key == credential key | Cert chain against FIDO MDS |
+| `"tpm"`, `"apple"` | Not implemented | — |
 
-If you need attestation chain verification, integrate with the
+**What certificate chain verification would add:** linking the attestation key
+back to a manufacturer's root certificate via the FIDO Metadata Service (MDS)
+confirms that the credential was generated inside genuine FIDO2 hardware of a
+specific make and model. Without MDS, you cannot rule out software authenticator
+emulators.
+
+If you need full device provenance verification, integrate with the
 [FIDO Metadata Service (MDS)](https://fidoalliance.org/metadata/).
-
-**Known limitation introduced by this scope:** relying parties that require
-high-assurance device binding (banking, government) must validate attestation
-outside this library.
 
 ---
 
@@ -317,5 +330,5 @@ outside this library.
 | Sign count monotonicity | Library | Non-zero counts only |
 | User verification | **Caller** | Check `user_verified` if required |
 | HTTPS enforcement | **Caller** / infrastructure | Browsers require it |
-| Attestation trust | **Caller** | Library only validates "none" |
+| Attestation trust | **Caller** | Signatures verified; cert chain requires FIDO MDS |
 | Credential storage | **Caller** | Treat as sensitive data |

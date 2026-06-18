@@ -16,10 +16,10 @@ the server-side verification logic for the two core WebAuthn ceremonies:
   challenge with the stored private key, and the relying party verifies the
   signature and sign count.
 
-Supported algorithms: **ES256** (ECDSA P-256, COSE `-7`) and **RS256** (RSA PKCS#1
-v1.5 SHA-256, COSE `-257`).
+Supported algorithms: **ES256** (ECDSA P-256, COSE `-7`), **EdDSA** (Ed25519,
+COSE `-8`), and **RS256** (RSA PKCS#1 v1.5 SHA-256, COSE `-257`).
 
-The library follows the [W3C WebAuthn Level 2 specification](https://www.w3.org/TR/webauthn-2/).
+The library follows the [W3C WebAuthn Level 3 specification](https://www.w3.org/TR/webauthn-3/).
 
 ### Project goals
 
@@ -38,19 +38,19 @@ The library follows the [W3C WebAuthn Level 2 specification](https://www.w3.org/
 |------|---------|
 | `src/lib.rs` | Public API surface: `RelyingParty`, wire types, re-exports |
 | `src/error.rs` | `WebAuthnError` enum + `Result<T>` alias |
-| `src/credential.rs` | `Credential`, `PublicKey { ES256, RS256 }`, `Challenge`, result types |
-| `src/algorithm.rs` | COSE algorithm constants: `COSE_ES256=-7`, `COSE_RS256=-257`, kty values |
+| `src/credential.rs` | `Credential`, `PublicKey { ES256, EdDSA, RS256 }`, `Challenge`, result types |
+| `src/algorithm.rs` | COSE algorithm constants: `COSE_ES256=-7`, `COSE_EDDSA=-8`, `COSE_RS256=-257`, kty values |
 | `src/der.rs` | DER builder: `rsa_components_to_der(n,e)` → RSAPublicKey for ring |
-| `src/crypto.rs` | `sha256`, `verify_es256`, `verify_rs256`, `generate_challenge` |
+| `src/crypto.rs` | `sha256`, `verify_es256`, `verify_eddsa`, `verify_rs256`, `generate_challenge` |
 | `src/challenge.rs` | Challenge expiry helpers: `is_expired`, `CHALLENGE_MAX_AGE_SECS` |
 | `src/client_data.rs` | `clientDataJSON` base64url → JSON → `ClientData` |
 | `src/authenticator_data.rs` | Binary authenticator data → `AuthenticatorData`; `CoseKey` enum |
-| `src/attestation.rs` | Attestation verification: "none" + packed self-attestation; detects packed basic |
+| `src/attestation.rs` | Attestation verification: "none", "packed", "fido-u2f", "android-key" |
 | `src/registration.rs` | §7.1 registration ceremony; dispatches `CoseKey` → `PublicKey` |
 | `src/authentication.rs` | §7.2 authentication ceremony; dispatches `PublicKey` → verifier |
 | `examples/demo.rs` | End-to-end demo: ES256 and RS256 registration/auth/replay |
 | `examples/server.rs` | Axum HTTP server: all 5 WebAuthn endpoints with in-memory state |
-| `tests/integration.rs` | Integration tests for ES256 and RS256 full ceremony flows |
+| `tests/integration.rs` | Integration tests for ES256, EdDSA, and RS256 full ceremony flows |
 
 ---
 
@@ -266,8 +266,9 @@ Canonical spec: https://www.w3.org/TR/webauthn-3/
 | Limitation | Notes |
 |------------|-------|
 | Packed basic attestation cert chain | `x5c` detected, `AttestationType::Basic` returned; chain not verified (no MDS) |
-| FIDO U2F cert chain | `x5c` signature verified, cert chain not verified (no MDS trust anchors) |
-| `"tpm"` / `"android-key"` attestation | Not implemented |
+| FIDO U2F cert chain | Signature verified, cert chain not verified (no MDS trust anchors) |
+| Android Key cert chain | Signature + key-match verified, cert chain not verified (no MDS trust anchors) |
+| `"tpm"` / `"apple"` attestation | Not implemented |
 | Extension data ignored | The extensions section of authenticator data is parsed but silently skipped |
 | `crossOrigin: true` accepted | Some RPs should reject cross-origin requests; currently allowed |
 | Challenge single-use enforcement | The caller is responsible — the library does not maintain a used-challenge set |
@@ -469,9 +470,9 @@ for a security library: it eliminates entire classes of memory safety vulnerabil
 at compile time and signals to reviewers that no unsafe code exists anywhere in this
 crate. All security-critical operations remain inside `ring`'s audited boundary.
 
-### Packed attestation verification
+### Attestation verification
 
-`src/attestation.rs` now implements W3C WebAuthn §8.2 for the `"packed"` format:
+`src/attestation.rs` implements multiple attestation formats:
 
 - **Self-attestation** (`x5c` absent): `alg` verified to match the credential key
   algorithm, `authData || clientDataHash` verified using `verify_es256` or
@@ -480,7 +481,12 @@ crate. All security-critical operations remain inside `ring`'s audited boundary.
   Certificate chain is not verified — no FIDO MDS trust anchor set available.
 - **FIDO U2F** (`"fido-u2f"`): signature verified against the attestation cert's
   EC P-256 public key. Returns `AttestationType::Basic`. Certificate chain not verified.
-- Other formats (`"tpm"`, `"android-key"`, etc.): accepted with `AttestationType::None`
+- **Android Key** (`"android-key"`): `alg`, `sig`, and `x5c` are required. The
+  attestation cert's EC P-256 public key must equal the credential public key
+  (the key security property proving the key lives in a hardware-backed Keystore).
+  Signature verified over `authData || clientDataHash`. Returns `AttestationType::Basic`.
+  Certificate chain not verified.
+- Other formats (`"tpm"`, `"apple"`, etc.): accepted with `AttestationType::None`
   (provenance unverifiable but credential usable).
 
 `parse_attestation_object` in `registration.rs` was updated to return the `attStmt`
