@@ -1582,3 +1582,28 @@ fn no_panic_on_random_authentication_input() {
         let _ = rp.verify_authentication(&credential, &challenge, &response);
     }
 }
+
+// ─── Multi-origin tests ───────────────────────────────────────────────────────
+
+#[test]
+fn multi_origin_relying_party_accepts_registered_origin() {
+    let fixture = Fixture::new();
+    let rp = RelyingParty::with_origins(
+        RP_ID,
+        ["https://example.com", "http://localhost:8080"],
+        "Test RP",
+    );
+    let challenge = Challenge::new().unwrap();
+    // Use the second origin in the list.
+    let response = fixture.make_registration_response(
+        &challenge.bytes,
+        "webauthn.create",
+        "http://localhost:8080",
+        RP_ID,
+        0x41, // UP + AT flags
+        1,
+        "none",
+    );
+    rp.verify_registration(&challenge, &response, b"test-user")
+        .unwrap();
+}

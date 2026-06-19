@@ -86,7 +86,12 @@ fn verify_authentication_inner(
     // Verify the challenge matches.
     // ── §7.2 step 15 ─────────────────────────────────────────────────────────
     // Verify the origin matches rp.origin.
-    client_data::validate_client_data(&parsed_cd, "webauthn.get", &challenge.bytes, &rp.origin)?;
+    client_data::validate_client_data(
+        &parsed_cd,
+        "webauthn.get",
+        &challenge.bytes,
+        &rp.allowed_origins,
+    )?;
 
     // ── §7.2 step 17 ─────────────────────────────────────────────────────────
     // Let hash be SHA-256(clientDataJSON bytes).

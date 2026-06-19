@@ -40,7 +40,15 @@ use crate::error::{Result, WebAuthnError};
 /// ```rust,no_run
 /// use webauthn::RelyingParty;
 ///
+/// // Single origin — typical production setup.
 /// let rp = RelyingParty::new("example.com", "https://example.com", "My Service");
+///
+/// // Multiple origins — e.g. prod + local dev in one instance.
+/// let rp = RelyingParty::with_origins(
+///     "example.com",
+///     ["https://example.com", "http://localhost:8080"],
+///     "My Service",
+/// );
 /// ```
 #[derive(Debug, Clone)]
 pub struct RelyingParty {
@@ -50,18 +58,19 @@ pub struct RelyingParty {
     /// `navigator.credentials.create()` / `get()` call options.
     pub id: String,
 
-    /// Full origin of the web app, e.g. `"https://example.com"`.
+    /// The set of origins this RP accepts, e.g. `["https://example.com"]`.
     ///
-    /// Must match `window.location.origin` in the browser exactly — scheme,
-    /// host, and port all matter.
-    pub origin: String,
+    /// Each entry must match `window.location.origin` exactly — scheme, host,
+    /// and port all matter. A client-supplied origin is accepted if it equals
+    /// any entry in this list.
+    pub allowed_origins: Vec<String>,
 
     /// Human-readable name shown to users, e.g. `"My Service"`.
     pub name: String,
 }
 
 impl RelyingParty {
-    /// Create a new `RelyingParty` with the given configuration.
+    /// Create a new `RelyingParty` that accepts a single origin.
     ///
     /// # Arguments
     /// * `id`     — Relying party ID, e.g. `"example.com"`.
@@ -70,7 +79,30 @@ impl RelyingParty {
     pub fn new(id: &str, origin: &str, name: &str) -> Self {
         Self {
             id: id.to_string(),
-            origin: origin.to_string(),
+            allowed_origins: vec![origin.to_string()],
+            name: name.to_string(),
+        }
+    }
+
+    /// Create a new `RelyingParty` that accepts multiple origins.
+    ///
+    /// Use this when your app is served from more than one origin — for example,
+    /// `https://example.com` in production and `http://localhost:8080` in
+    /// development — and you want a single `RelyingParty` instance to handle
+    /// both environments.
+    ///
+    /// # Arguments
+    /// * `id`      — Relying party ID, e.g. `"example.com"`.
+    /// * `origins` — Iterator of accepted origins.
+    /// * `name`    — Human-readable service name.
+    pub fn with_origins(
+        id: &str,
+        origins: impl IntoIterator<Item = impl Into<String>>,
+        name: &str,
+    ) -> Self {
+        Self {
+            id: id.to_string(),
+            allowed_origins: origins.into_iter().map(Into::into).collect(),
             name: name.to_string(),
         }
     }
@@ -131,7 +163,12 @@ fn verify_registration_inner(
     // Verify that C.challenge equals the issued challenge.
     // ── §7.1 step 9 ───────────────────────────────────────────────────────────
     // Verify that C.origin matches the relying party's origin.
-    client_data::validate_client_data(&parsed_cd, "webauthn.create", &challenge.bytes, &rp.origin)?;
+    client_data::validate_client_data(
+        &parsed_cd,
+        "webauthn.create",
+        &challenge.bytes,
+        &rp.allowed_origins,
+    )?;
 
     // ── §7.1 step 11 ──────────────────────────────────────────────────────────
     // Let hash be SHA-256(clientDataJSON bytes).

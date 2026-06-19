@@ -96,17 +96,18 @@ pub fn parse_client_data(raw: &[u8]) -> Result<ParsedClientData> {
 /// * `parsed`             — Output of [`parse_client_data`].
 /// * `expected_type`      — `"webauthn.create"` or `"webauthn.get"`.
 /// * `expected_challenge` — The raw challenge bytes the relying party issued.
-/// * `expected_origin`    — Full origin of your web app, e.g. `"https://example.com"`.
+/// * `allowed_origins`    — All origins this RP accepts. The client-supplied
+///   origin must equal at least one entry exactly.
 ///
 /// # Errors
 /// - [`WebAuthnError::InvalidClientData`] — type field does not match.
 /// - [`WebAuthnError::ChallengeMismatch`] — challenge bytes do not match.
-/// - [`WebAuthnError::OriginMismatch`]    — origin does not match.
+/// - [`WebAuthnError::OriginMismatch`]    — origin is not in the allowed list.
 pub fn validate_client_data(
     parsed: &ParsedClientData,
     expected_type: &str,
     expected_challenge: &[u8],
-    expected_origin: &str,
+    allowed_origins: &[String],
 ) -> Result<()> {
     // Verify the ceremony type. An empty type string is always wrong.
     if parsed.type_.is_empty() {
@@ -127,10 +128,10 @@ pub fn validate_client_data(
         return Err(WebAuthnError::ChallengeMismatch);
     }
 
-    // Verify the origin.
-    if parsed.origin != expected_origin {
+    // Verify the origin is in the allowed list.
+    if !allowed_origins.iter().any(|o| o == &parsed.origin) {
         return Err(WebAuthnError::OriginMismatch {
-            expected: expected_origin.to_string(),
+            expected: allowed_origins.join(", "),
             got: parsed.origin.clone(),
         });
     }
@@ -193,14 +194,9 @@ mod tests {
         let b64 = URL_SAFE_NO_PAD.encode(&challenge);
         let raw = make_raw("webauthn.create", &b64, "https://example.com");
         let parsed = parse_client_data(&raw).unwrap();
+        let origins = vec!["https://example.com".to_string()];
 
-        validate_client_data(
-            &parsed,
-            "webauthn.create",
-            &challenge,
-            "https://example.com",
-        )
-        .unwrap();
+        validate_client_data(&parsed, "webauthn.create", &challenge, &origins).unwrap();
     }
 
     #[test]
@@ -209,14 +205,10 @@ mod tests {
         let b64 = URL_SAFE_NO_PAD.encode(&challenge);
         let raw = make_raw("webauthn.get", &b64, "https://example.com");
         let parsed = parse_client_data(&raw).unwrap();
+        let origins = vec!["https://example.com".to_string()];
 
-        let err = validate_client_data(
-            &parsed,
-            "webauthn.create",
-            &challenge,
-            "https://example.com",
-        )
-        .unwrap_err();
+        let err =
+            validate_client_data(&parsed, "webauthn.create", &challenge, &origins).unwrap_err();
         assert!(matches!(err, WebAuthnError::InvalidClientData(_)));
     }
 
@@ -227,9 +219,9 @@ mod tests {
         let b64 = URL_SAFE_NO_PAD.encode(&challenge);
         let raw = make_raw("webauthn.create", &b64, "https://example.com");
         let parsed = parse_client_data(&raw).unwrap();
+        let origins = vec!["https://example.com".to_string()];
 
-        let err = validate_client_data(&parsed, "webauthn.create", &wrong, "https://example.com")
-            .unwrap_err();
+        let err = validate_client_data(&parsed, "webauthn.create", &wrong, &origins).unwrap_err();
         assert!(matches!(err, WebAuthnError::ChallengeMismatch));
     }
 
@@ -239,14 +231,10 @@ mod tests {
         let b64 = URL_SAFE_NO_PAD.encode(&challenge);
         let raw = make_raw("webauthn.create", &b64, "https://evil.com");
         let parsed = parse_client_data(&raw).unwrap();
+        let origins = vec!["https://example.com".to_string()];
 
-        let err = validate_client_data(
-            &parsed,
-            "webauthn.create",
-            &challenge,
-            "https://example.com",
-        )
-        .unwrap_err();
+        let err =
+            validate_client_data(&parsed, "webauthn.create", &challenge, &origins).unwrap_err();
         assert!(matches!(
             err,
             WebAuthnError::OriginMismatch { expected, got }
@@ -324,13 +312,9 @@ mod tests {
         let b64 = URL_SAFE_NO_PAD.encode(&challenge);
         let raw = make_raw("", &b64, "https://example.com");
         let parsed = parse_client_data(&raw).unwrap();
-        let err = validate_client_data(
-            &parsed,
-            "webauthn.create",
-            &challenge,
-            "https://example.com",
-        )
-        .unwrap_err();
+        let origins = vec!["https://example.com".to_string()];
+        let err =
+            validate_client_data(&parsed, "webauthn.create", &challenge, &origins).unwrap_err();
         assert!(matches!(err, WebAuthnError::InvalidClientData(ref m) if m.contains("empty")));
     }
 
@@ -341,13 +325,9 @@ mod tests {
         let b64 = URL_SAFE_NO_PAD.encode(&challenge);
         let raw = make_raw("webauthn.create", &b64, "https://example.com/");
         let parsed = parse_client_data(&raw).unwrap();
-        let err = validate_client_data(
-            &parsed,
-            "webauthn.create",
-            &challenge,
-            "https://example.com",
-        )
-        .unwrap_err();
+        let origins = vec!["https://example.com".to_string()];
+        let err =
+            validate_client_data(&parsed, "webauthn.create", &challenge, &origins).unwrap_err();
         assert!(matches!(err, WebAuthnError::OriginMismatch { .. }));
     }
 
@@ -362,12 +342,49 @@ mod tests {
         )
         .into_bytes();
         let parsed = parse_client_data(&raw).unwrap();
-        validate_client_data(
-            &parsed,
-            "webauthn.create",
-            &challenge,
-            "https://example.com",
-        )
-        .expect("crossOrigin:true should not cause validation failure");
+        let origins = vec!["https://example.com".to_string()];
+        validate_client_data(&parsed, "webauthn.create", &challenge, &origins)
+            .expect("crossOrigin:true should not cause validation failure");
+    }
+
+    #[test]
+    fn validate_accepts_origin_in_multi_origin_list() {
+        let challenge = vec![0u8; 32];
+        let b64 = URL_SAFE_NO_PAD.encode(&challenge);
+        let raw = make_raw("webauthn.create", &b64, "https://second.com");
+        let parsed = parse_client_data(&raw).unwrap();
+        let origins = vec![
+            "https://first.com".to_string(),
+            "https://second.com".to_string(),
+        ];
+        validate_client_data(&parsed, "webauthn.create", &challenge, &origins).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_origin_not_in_list() {
+        let challenge = vec![0u8; 32];
+        let b64 = URL_SAFE_NO_PAD.encode(&challenge);
+        let raw = make_raw("webauthn.create", &b64, "https://evil.com");
+        let parsed = parse_client_data(&raw).unwrap();
+        let origins = vec![
+            "https://first.com".to_string(),
+            "https://second.com".to_string(),
+        ];
+        let err =
+            validate_client_data(&parsed, "webauthn.create", &challenge, &origins).unwrap_err();
+        assert!(matches!(
+            err,
+            WebAuthnError::OriginMismatch { got, .. } if got == "https://evil.com"
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_single_origin_list() {
+        let challenge = vec![0u8; 32];
+        let b64 = URL_SAFE_NO_PAD.encode(&challenge);
+        let raw = make_raw("webauthn.create", &b64, "https://example.com");
+        let parsed = parse_client_data(&raw).unwrap();
+        let origins = vec!["https://example.com".to_string()];
+        validate_client_data(&parsed, "webauthn.create", &challenge, &origins).unwrap();
     }
 }
