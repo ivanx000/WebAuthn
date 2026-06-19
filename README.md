@@ -41,6 +41,8 @@ worthless without private keys), and password reuse (each site gets a unique key
 | Authentication ceremony (W3C WebAuthn §7.2) | ✅ Implemented |
 | ES256 (ECDSA P-256 + SHA-256, COSE -7) | ✅ Implemented |
 | RS256 (RSA PKCS#1 v1.5 + SHA-256, COSE -257) | ✅ Implemented |
+| EdDSA / Ed25519 (COSE -8) | ✅ Implemented |
+| Multiple allowed origins (`RelyingParty::with_origins`) | ✅ Implemented |
 | `"none"` attestation format | ✅ Implemented |
 | Packed self-attestation (no x5c) | ✅ Implemented — signature fully verified |
 | Packed basic attestation (x5c present) | ⚠️ Detected, certificate chain not verified |
@@ -51,7 +53,6 @@ worthless without private keys), and password reuse (each site gets a unique key
 | `#![forbid(unsafe_code)]` | ✅ Enforced at compile time |
 | No-panic guarantee on adversarial input | ✅ `#![deny(clippy::unwrap_used)]` |
 | Fixed test vectors (registration + authentication) | ✅ Implemented |
-| EdDSA / Ed25519 | ✅ Implemented |
 | TPM attestation | ❌ Not implemented |
 | Token binding | ❌ Not implemented |
 | FIDO Metadata Service (MDS) lookup | ❌ Not implemented |
@@ -68,7 +69,15 @@ use webauthn::{RelyingParty, AuthenticatorAttestationResponse,
                AuthenticatorAssertionResponse, Challenge};
 
 // 1. Configure the relying party once, at startup.
+//    Use new() for a single origin, or with_origins() to accept multiple
+//    (e.g. production + localhost for local development).
 let rp = RelyingParty::new("example.com", "https://example.com", "My Service");
+// — or —
+// let rp = RelyingParty::with_origins(
+//     "example.com",
+//     ["https://example.com", "http://localhost:8080"],
+//     "My Service",
+// );
 
 // ── Registration ──────────────────────────────────────────
 // 2. Generate a challenge and send it to the browser.
@@ -158,7 +167,7 @@ curl -s -X POST http://localhost:3000/authenticate/begin \
 ## Running tests
 
 ```bash
-cargo test                        # all 168+ unit + integration + doc tests
+cargo test                        # all 172+ unit + integration + doc tests
 cargo clippy -- -D warnings       # lint (zero-warning policy)
 cargo fmt --check                 # formatting
 cargo doc --no-deps               # API docs (zero warnings)
@@ -171,9 +180,10 @@ cargo package --dry-run           # crates.io readiness check
 
 ### What the library verifies
 
-- **Origin binding** — `clientDataJSON.origin` must exactly equal `expected_origin`.
-  This defeats cross-origin replays (a credential from `bank.com` cannot be used at
-  `evil.com`).
+- **Origin binding** — `clientDataJSON.origin` must exactly equal one of the origins
+  in `allowed_origins`. This defeats cross-origin replays (a credential from `bank.com`
+  cannot be used at `evil.com`). `RelyingParty::new` accepts a single origin;
+  `RelyingParty::with_origins` accepts a list for multi-environment deployments.
 
 - **RP ID binding** — the authenticator data's `rpIdHash` is verified to equal
   `SHA-256(rp_id)`. This binds the credential to the relying party identifier.

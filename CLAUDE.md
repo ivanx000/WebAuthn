@@ -121,7 +121,7 @@ joins them into the `0x04 || x || y` form during parsing.
 | §7.1 step 5 | Parse `clientDataJSON` (base64url → JSON) | `client_data::parse` |
 | §7.1 step 7 | `type` field must equal `"webauthn.create"` | inline check |
 | §7.1 step 8 | Challenge in client data must match issued challenge | inline check |
-| §7.1 step 9 | Origin must match `expected_origin` exactly | inline check |
+| §7.1 step 9 | Origin must be in `allowed_origins` (exact match, any entry) | inline check |
 | §7.1 step 11 | Hash `clientDataJSON` with SHA-256 | `crypto::sha256` |
 | §7.1 step 12 | Decode `attestationObject` (base64url → CBOR bytes) | inline |
 | §7.1 step 13 | Parse CBOR attestation object → `(fmt, authData)` | `parse_attestation_object` |
@@ -146,7 +146,7 @@ are either delegated to the caller or intentionally out of scope for a library.
 | §7.2 step 11 | Parse `clientDataJSON` (base64url → JSON) | `client_data::parse` |
 | §7.2 step 13 | `type` field must equal `"webauthn.get"` | inline check |
 | §7.2 step 14 | Challenge must match issued challenge | inline check |
-| §7.2 step 15 | Origin must match `expected_origin` exactly | inline check |
+| §7.2 step 15 | Origin must be in `allowed_origins` (exact match, any entry) | inline check |
 | §7.2 step 17 | Hash `clientDataJSON` with SHA-256 | `crypto::sha256` |
 | §7.2 step 18 | Decode + parse `authenticatorData` bytes | `authenticator_data::parse` |
 | §7.2 step 19 | `rpIdHash` must equal SHA-256(credential's `rp_id`) | inline check |
@@ -537,6 +537,48 @@ added as dev-dependencies.
 3. `cargo package --no-verify` to verify the .crate file.
 4. `git tag v<version> && git push --tags`.
 5. `cargo publish` (requires `cargo login` with crates.io token first).
+
+---
+
+## Multiple allowed origins
+
+`RelyingParty` now holds `allowed_origins: Vec<String>` instead of a single
+`origin: String`. The origin check in `validate_client_data` accepts the
+client-supplied origin if it equals **any** entry in the list (exact match).
+
+### Constructors
+
+| Constructor | When to use |
+|-------------|-------------|
+| `RelyingParty::new(id, origin, name)` | Single origin — existing callers compile unchanged |
+| `RelyingParty::with_origins(id, origins, name)` | Multiple origins — accepts any `IntoIterator<Item = impl Into<String>>` |
+
+```rust
+// Single origin (backward-compatible with all existing code)
+let rp = RelyingParty::new("example.com", "https://example.com", "My Service");
+
+// Multiple origins — prod + localhost in one instance
+let rp = RelyingParty::with_origins(
+    "example.com",
+    ["https://example.com", "http://localhost:8080"],
+    "My Service",
+);
+```
+
+### Error behaviour
+
+`WebAuthnError::OriginMismatch.expected` now contains the allowed list formatted
+as a comma-separated string (e.g. `"https://example.com, http://localhost:8080"`).
+For a single-origin RP the string is identical to the old single-origin display.
+
+### What changed
+
+| File | Change |
+|------|--------|
+| `src/registration.rs` | `RelyingParty.origin` → `allowed_origins: Vec<String>`; added `with_origins()` |
+| `src/authentication.rs` | Passes `&rp.allowed_origins` to `validate_client_data` |
+| `src/client_data.rs` | `validate_client_data` last param `&str` → `&[String]`; origin check uses `.any()` |
+| `tests/integration.rs` | Added `multi_origin_relying_party_accepts_registered_origin` |
 
 ---
 

@@ -55,13 +55,27 @@ running a WebAuthn ceremony will produce a response with `origin: "https://evil.
 If the relying party at `https://bank.com` does not check the origin, that
 response could be used to authenticate there.
 
-This library compares `client_data.origin == expected_origin` as an exact byte
-comparison. There is no fuzzy matching, subdomain allowlisting, or wildcards.
-The caller must supply the exact origin (scheme + host + port) that should be accepted.
+This library checks that `client_data.origin` exactly equals **at least one** entry
+in `RelyingParty::allowed_origins`. There is no fuzzy matching, subdomain
+allowlisting, or wildcards — each entry must be the exact origin
+(scheme + host + port). Use `RelyingParty::new` for a single origin or
+`RelyingParty::with_origins` for multiple:
 
-**Example values:**
+```rust
+// Production only
+let rp = RelyingParty::new("example.com", "https://example.com", "My Service");
+
+// Production + local development in one instance
+let rp = RelyingParty::with_origins(
+    "example.com",
+    ["https://example.com", "http://localhost:8080"],
+    "My Service",
+);
+```
+
+**Example valid entries:**
 - `"https://example.com"` — production
-- `"http://localhost:8080"` — local development (note: HTTP is allowed for localhost)
+- `"http://localhost:8080"` — local development (HTTP is permitted for localhost)
 
 ### Why RP ID hash verification matters
 
@@ -323,7 +337,7 @@ If you need full device provenance verification, integrate with the
 | Challenge randomness | Library (`ring` CSPRNG) | 256 bits entropy |
 | Challenge single-use | **Caller** | Must invalidate after use |
 | Challenge expiry | Caller via `is_expired()` | Default 5 min |
-| Origin binding | Library | Exact string match |
+| Origin binding | Library | Exact match against `allowed_origins` list |
 | RP ID binding | Library | SHA-256 comparison |
 | User presence | Library | UP flag check |
 | Signature validity | Library (`ring` ECDSA/RSA) | Constant-time |

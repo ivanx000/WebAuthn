@@ -10,6 +10,8 @@ How this WebAuthn library is structured and why.
 webauthn
 ├── lib.rs                  Public API surface
 │   └── RelyingParty        Stateless ceremony verifier (entry point)
+│         ├── new(id, origin, name)          Single-origin constructor
+│         └── with_origins(id, origins, name) Multi-origin constructor
 │   └── AuthenticatorAttestationResponse   Registration wire type
 │   └── AuthenticatorAssertionResponse     Authentication wire type
 │
@@ -79,7 +81,7 @@ AuthenticatorAttestationResponse
     │     │
     │     ├─ verify type == "webauthn.create"
     │     ├─ verify challenge bytes match issued challenge
-    │     └─ verify origin == expected_origin
+    │     └─ verify origin ∈ allowed_origins (exact match, any entry)
     │
     │  attestation_object  (raw bytes)
     └─► CBOR decode (ciborium) → {fmt, authData}
@@ -110,7 +112,7 @@ Stored Credential + AuthenticatorAssertionResponse
          [type="webauthn.get"]
                │
         validate_client_data()
-         challenge match + origin match
+         challenge match + origin ∈ allowed_origins
                │
         SHA-256(clientDataJSON bytes) → clientDataHash
                │
@@ -254,7 +256,5 @@ Every error in this library follows three rules:
 - **ES384 / ES512** — not supported; would require P-384/P-521 ring API.
 - **Extension data** — authenticator data extensions are silently ignored.
 - **Token binding** — not checked.
-- **Multiple origins** — a `Vec<String>` of allowed origins could replace the
-  single `expected_origin`.
 - **`crossOrigin` enforcement** — the `crossOrigin: true` case is accepted, which
   some relying parties should reject.
