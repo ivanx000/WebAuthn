@@ -208,7 +208,7 @@ async fn register_begin(
         challenge: challenge_b64,
         rp: RpInfo {
             id: "localhost",
-            name: "WebAuthn Demo",
+            name: "Caden Demo",
         },
         user: UserInfo {
             id: req.user_id,
@@ -425,7 +425,7 @@ async fn main() {
     let state = Arc::new(AppState {
         pending_challenges: Mutex::new(HashMap::new()),
         credentials: Mutex::new(HashMap::new()),
-        relying_party: RelyingParty::new("localhost", "http://localhost:3000", "WebAuthn Demo"),
+        relying_party: RelyingParty::new("localhost", "http://localhost:3000", "Caden Demo"),
     });
 
     let app = Router::new()
@@ -440,7 +440,7 @@ async fn main() {
         .await
         .expect("failed to bind to port 3000");
 
-    println!("WebAuthn demo server running on http://localhost:3000");
+    println!("Caden demo server running on http://localhost:3000");
     println!();
     println!("Endpoints:");
     println!("  GET  /health");

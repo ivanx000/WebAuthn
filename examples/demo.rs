@@ -111,12 +111,12 @@ const RSA_PKCS8_DER: &[u8] = &[
 ];
 
 fn main() -> Result<()> {
-    println!("WebAuthn demo");
+    println!("🔑 Caden demo");
     println!("─────────────────────────────────────");
 
     let rng = SystemRandom::new();
 
-    let rp = RelyingParty::new(RP_ID, ORIGIN, "WebAuthn Demo");
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Caden Demo");
 
     // ── ES256: Step 1: Generate authenticator keypair ─────────────────────────
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
