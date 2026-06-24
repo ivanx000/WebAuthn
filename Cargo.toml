@@ -1,5 +1,5 @@
 [package]
-name = "webauthn-rs-demo"
+name = "caden"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.70"
@@ -8,8 +8,8 @@ keywords = ["webauthn", "passkey", "fido", "authentication", "security"]
 categories = ["authentication", "cryptography", "web-programming"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/ivanxie/WebAuthn"
-documentation = "https://docs.rs/webauthn-rs-demo"
+repository = "https://github.com/ivanxie/caden-rs"
+documentation = "https://docs.rs/caden"
 
 [lib]
 # Keep the Rust crate name as `webauthn` so existing code and examples import
