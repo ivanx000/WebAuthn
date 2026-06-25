@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-06-24
+
+### Added
+
+- **Apple attestation** (`"apple"`, W3C WebAuthn §8.8) — `attestation::verify` now handles
+  the Apple format. `x5c` is required. The Apple nonce extension (OID
+  `1.2.840.113635.100.8.2`) is extracted from the credential certificate; its value must
+  equal `SHA-256(authData || clientDataHash)`. The cert's EC P-256 public key must match
+  the credential public key. Returns `AttestationType::Basic`. Certificate chain not
+  verified (no Apple MDS trust anchors). DER TLV parsing helpers (`der_parse_tlv`,
+  `der_unwrap_sequence`, `der_unwrap_octet_string`) added inline — no new dependencies.
+
+- **UV flag enforcement** (`RelyingParty::require_user_verification`) — `RelyingParty`
+  now has a `require_user_verification: bool` field (defaults to `false` — no breaking
+  change). Set via the new builder method `require_user_verification(true)`. When enabled,
+  `verify_authentication` enforces §7.2 step 21: if the UV flag is not set, it returns
+  `WebAuthnError::UserNotVerified` (new error variant). This is the library-level mechanism
+  for applications that need mandatory biometric or PIN verification on every sign-in.
+
+---
+
 ## [0.2.0] — 2026-06-21
 
 ### Added
@@ -81,5 +102,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **End-to-end demo** — `examples/demo.rs` exercises ES256 + RS256 registration, authentication,
   and replay attack rejection entirely in software
 
+[0.3.0]: https://github.com/ivanxie/caden-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ivanxie/caden-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ivanxie/caden-rs/releases/tag/v0.1.0
