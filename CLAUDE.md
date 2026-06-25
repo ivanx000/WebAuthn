@@ -154,7 +154,7 @@ are either delegated to the caller or intentionally out of scope for a library.
 | §7.2 step 18 | Decode + parse `authenticatorData` bytes | `authenticator_data::parse` |
 | §7.2 step 19 | `rpIdHash` must equal SHA-256(credential's `rp_id`) | inline check |
 | §7.2 step 20 | User Present (UP) flag must be set | inline check |
-| §7.2 step 21 | UV check — optional, delegated to caller | noted in comment |
+| §7.2 step 21 | UV flag enforced when `rp.require_user_verification == true`; skipped by default | inline check |
 | §7.2 step 23 | Decode DER signature bytes (base64url → bytes) | inline |
 | §7.2 step 24 | Verify signature over `authData \|\| SHA-256(clientDataJSON)` | `crypto::verify_es256` or `crypto::verify_rs256` |
 | §7.2 step 25 | Sign count must be strictly greater than stored value | inline check |
@@ -277,7 +277,7 @@ Canonical spec: https://www.w3.org/TR/webauthn-3/
 | `crossOrigin: true` accepted | Some RPs should reject cross-origin requests; currently allowed |
 | Challenge single-use enforcement | The caller is responsible — the library does not maintain a used-challenge set |
 | No FIDO Metadata Service | Authenticator model/provenance cannot be verified |
-| UV flag not enforced | User Verification flag is returned but not required; caller decides |
+| UV flag optional | Off by default; enable with `RelyingParty::new(...).require_user_verification(true)` |
 
 ---
 

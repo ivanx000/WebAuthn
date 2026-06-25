@@ -60,7 +60,7 @@ webauthn
 │         └── CoseKey::RSA { alg, n, e }         for RS256
 │
 ├── attestation.rs          Attestation statement verification
-│   └── verify()            Supports "none", "packed", "fido-u2f", "android-key"
+│   └── verify()            Supports "none", "packed", "fido-u2f", "android-key", "apple"
 │
 ├── registration.rs         §7.1 registration ceremony
 │   └── verify_registration()  Dispatches CoseKey → PublicKey::ES256 or ::RS256
@@ -219,6 +219,7 @@ returns 270 bytes (RSAPublicKey), not 294 bytes (SubjectPublicKeyInfo).
 | §8.4 Android Key attestation | `attestation.rs::verify_android_key` |
 | §8.6 FIDO U2F attestation | `attestation.rs::verify_fido_u2f` |
 | §8.7 "none" attestation | `attestation.rs::verify` |
+| §8.8 Apple attestation | `attestation.rs::verify_apple` |
 | RFC 8152 COSE keys | `authenticator_data::parse_cose_key` |
 
 ---
@@ -251,8 +252,10 @@ Every error in this library follows three rules:
   `"android-key"` attestation signatures are verified, but the certificate chain
   linking the attestation key back to a manufacturer root is not. Full chain
   validation requires the FIDO Metadata Service (MDS).
-- **TPM / Apple attestation** — not implemented; require manufacturer-specific cert
-  chains and are out of scope.
+- **Apple attestation cert chain** — nonce extension and key-match verified; certificate
+  chain not verified (no Apple MDS trust anchors).
+- **TPM attestation** — not implemented; requires manufacturer-specific cert chains and is
+  out of scope.
 - **ES384 / ES512** — not supported; would require P-384/P-521 ring API.
 - **Extension data** — authenticator data extensions are silently ignored.
 - **Token binding** — not checked.

@@ -48,6 +48,8 @@ worthless without private keys), and password reuse (each site gets a unique key
 | Packed basic attestation (x5c present) | ⚠️ Detected, certificate chain not verified |
 | FIDO U2F attestation (`"fido-u2f"`) | ✅ Implemented — signature verified; cert chain requires FIDO MDS |
 | Android Key attestation (`"android-key"`) | ✅ Implemented — signature + key-match verified; cert chain requires FIDO MDS |
+| Apple attestation (`"apple"`) | ✅ Implemented — nonce extension + key-match verified; cert chain requires Apple MDS |
+| UV flag enforcement (`require_user_verification`) | ✅ Implemented — opt-in via builder; off by default |
 | Sign-count replay attack detection | ✅ Implemented |
 | Challenge generation (32-byte CSPRNG) | ✅ Implemented |
 | `#![forbid(unsafe_code)]` | ✅ Enforced at compile time |
@@ -167,7 +169,7 @@ curl -s -X POST http://localhost:3000/authenticate/begin \
 ## Running tests
 
 ```bash
-cargo test                        # all 172+ unit + integration + doc tests
+cargo test                        # all 182+ unit + integration + doc tests
 cargo clippy -- -D warnings       # lint (zero-warning policy)
 cargo fmt --check                 # formatting
 cargo doc --no-deps               # API docs (zero warnings)
@@ -194,6 +196,11 @@ cargo package --dry-run           # crates.io readiness check
 
 - **User presence** — the UP flag in authenticator data must be set. The
   authenticator confirmed that a human was physically present.
+
+- **User verification (opt-in)** — when `require_user_verification(true)` is set on
+  the `RelyingParty`, the UV flag must also be set. This enforces that the authenticator
+  verified the user's identity (PIN, biometric) before signing. Disabled by default;
+  enable for sensitive flows (payment authorization, privileged settings).
 
 - **Cryptographic signature** — the signature over `authData || SHA-256(clientDataJSON)`
   is verified using `ring`:

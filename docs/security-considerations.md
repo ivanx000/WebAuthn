@@ -167,17 +167,32 @@ The User Verification (UV) flag indicates that the authenticator performed a
 verification step beyond simple presence — for example, a biometric check (Touch ID,
 Face ID) or a PIN entry. It does not mean the user typed a password.
 
-### Why this library does not enforce UV by default
+### Enforcing UV at the library level
 
-The WebAuthn spec (§7.2 step 21) states that UV enforcement is optional and
-application-specific. Some applications (e.g. low-risk account actions) only need
-User Presence; others (e.g. payment authorization, sensitive settings) need User
-Verification. Enforcing UV inside the library would be too opinionated.
-
-Instead, `AuthenticationResult` exposes `user_verified: bool`. The caller decides
-whether to require it for their threat model:
+Use `RelyingParty::require_user_verification(true)` to have the library enforce UV
+on every `verify_authentication` call. When enabled, a response with the UV flag
+cleared returns `WebAuthnError::UserNotVerified` (§7.2 step 21):
 
 ```rust
+// Require user verification for this RP (e.g. a payment flow).
+let rp = RelyingParty::new("example.com", "https://example.com", "My Service")
+    .require_user_verification(true);
+
+// Any assertion without UV set will now return Err(WebAuthnError::UserNotVerified).
+let result = rp.verify_authentication(&credential, &challenge, &response)?;
+```
+
+UV is **off by default** (`false`) because some legitimate flows only need User
+Presence — the spec (§7.2 step 21) makes UV optional and application-specific.
+
+### Manual UV check (per-action enforcement)
+
+When different actions within the same application have different UV requirements,
+inspect `AuthenticationResult::user_verified` after verification instead of setting
+it on the RP:
+
+```rust
+let rp = RelyingParty::new("example.com", "https://example.com", "My Service");
 let result = rp.verify_authentication(&credential, &challenge, &response)?;
 if requires_uv && !result.user_verified {
     return Err("user verification required for this action");
@@ -317,7 +332,8 @@ This library verifies the following attestation formats:
 | `"packed"` (basic, x5c present) | x5c presence detected | Cert chain against FIDO MDS |
 | `"fido-u2f"` | ECDSA-P256 signature over U2F verification data | Cert chain against FIDO MDS |
 | `"android-key"` | ECDSA-P256 signature; cert key == credential key | Cert chain against FIDO MDS |
-| `"tpm"`, `"apple"` | Not implemented | — |
+| `"apple"` | Apple nonce extension == SHA-256(authData \|\| clientDataHash); cert key == credential key | Cert chain against Apple MDS |
+| `"tpm"` | Not implemented | — |
 
 **What certificate chain verification would add:** linking the attestation key
 back to a manufacturer's root certificate via the FIDO Metadata Service (MDS)
@@ -342,7 +358,7 @@ If you need full device provenance verification, integrate with the
 | User presence | Library | UP flag check |
 | Signature validity | Library (`ring` ECDSA/RSA) | Constant-time |
 | Sign count monotonicity | Library | Non-zero counts only |
-| User verification | **Caller** | Check `user_verified` if required |
+| User verification | Library (opt-in) or Caller | Enable with `require_user_verification(true)`, or inspect `user_verified` per action |
 | HTTPS enforcement | **Caller** / infrastructure | Browsers require it |
 | Attestation trust | **Caller** | Signatures verified; cert chain requires FIDO MDS |
 | Credential storage | **Caller** | Treat as sensitive data |
