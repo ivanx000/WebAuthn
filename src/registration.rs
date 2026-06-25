@@ -76,6 +76,17 @@ pub struct RelyingParty {
     /// See [`RelyingParty::require_user_verification`] to enable this at
     /// construction time using the builder pattern.
     pub require_user_verification: bool,
+
+    /// Whether to reject `clientDataJSON` that contains `crossOrigin: true`.
+    /// Defaults to `false`.
+    ///
+    /// A cross-origin credential use occurs when the WebAuthn call is made
+    /// from an iframe whose origin differs from the top-level page. When your
+    /// application never embeds WebAuthn in an iframe, set this to `true` to
+    /// close that attack surface (§7.1 step 10 / §7.2 step 12).
+    /// See [`RelyingParty::reject_cross_origin`] to enable this using the
+    /// builder pattern.
+    pub reject_cross_origin: bool,
 }
 
 impl RelyingParty {
@@ -91,6 +102,7 @@ impl RelyingParty {
             allowed_origins: vec![origin.to_string()],
             name: name.to_string(),
             require_user_verification: false,
+            reject_cross_origin: false,
         }
     }
 
@@ -115,6 +127,7 @@ impl RelyingParty {
             allowed_origins: origins.into_iter().map(Into::into).collect(),
             name: name.to_string(),
             require_user_verification: false,
+            reject_cross_origin: false,
         }
     }
 
@@ -135,6 +148,25 @@ impl RelyingParty {
     /// ```
     pub fn require_user_verification(mut self, required: bool) -> Self {
         self.require_user_verification = required;
+        self
+    }
+
+    /// Reject `clientDataJSON` that contains `crossOrigin: true` (§7.1 step 10).
+    ///
+    /// When `true`, any registration or authentication response from a
+    /// cross-origin iframe is rejected with
+    /// [`crate::error::WebAuthnError::CrossOriginNotAllowed`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use webauthn::RelyingParty;
+    ///
+    /// let rp = RelyingParty::new("example.com", "https://example.com", "My Service")
+    ///     .reject_cross_origin(true);
+    /// ```
+    pub fn reject_cross_origin(mut self, reject: bool) -> Self {
+        self.reject_cross_origin = reject;
         self
     }
 
@@ -194,11 +226,14 @@ fn verify_registration_inner(
     // Verify that C.challenge equals the issued challenge.
     // ── §7.1 step 9 ───────────────────────────────────────────────────────────
     // Verify that C.origin matches the relying party's origin.
+    // ── §7.1 step 10 ──────────────────────────────────────────────────────────
+    // If reject_cross_origin is set, reject crossOrigin: true.
     client_data::validate_client_data(
         &parsed_cd,
         "webauthn.create",
         &challenge.bytes,
         &rp.allowed_origins,
+        rp.reject_cross_origin,
     )?;
 
     // ── §7.1 step 11 ──────────────────────────────────────────────────────────

@@ -86,6 +86,15 @@ pub enum WebAuthnError {
     /// The `i64` is the raw COSE algorithm integer (e.g. `-7` = ES256, `-257` = RS256).
     #[error("Unsupported algorithm: {0}")]
     UnsupportedAlgorithm(i64),
+
+    /// `clientDataJSON` contains `crossOrigin: true` but the relying party has
+    /// `reject_cross_origin` enabled.
+    ///
+    /// Cross-origin credentials allow assertions from an iframe whose origin
+    /// differs from the top-level origin. When the RP does not expect embedded
+    /// usage, `crossOrigin: true` may indicate credential abuse.
+    #[error("Cross-origin credential use is not permitted by this relying party")]
+    CrossOriginNotAllowed,
 }
 
 /// Convenience alias so callers write `webauthn::Result<T>`.

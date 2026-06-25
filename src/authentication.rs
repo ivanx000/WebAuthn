@@ -86,11 +86,14 @@ fn verify_authentication_inner(
     // Verify the challenge matches.
     // ── §7.2 step 15 ─────────────────────────────────────────────────────────
     // Verify the origin matches rp.origin.
+    // ── §7.2 step 12 ─────────────────────────────────────────────────────────
+    // If reject_cross_origin is set, reject crossOrigin: true.
     client_data::validate_client_data(
         &parsed_cd,
         "webauthn.get",
         &challenge.bytes,
         &rp.allowed_origins,
+        rp.reject_cross_origin,
     )?;
 
     // ── §7.2 step 17 ─────────────────────────────────────────────────────────
