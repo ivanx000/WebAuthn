@@ -164,6 +164,14 @@ pub struct RegistrationResult {
 
     /// What kind of attestation the authenticator provided.
     pub attestation_type: AttestationType,
+
+    /// Whether the registered credential is eligible for backup to a platform
+    /// sync service (BE flag). This value is set by the authenticator and is
+    /// immutable — it will not change in future ceremonies for this credential.
+    pub backup_eligible: bool,
+
+    /// Whether the credential was backed up at the time of registration (BS flag).
+    pub backup_state: bool,
 }
 
 /// Successful outcome of an authentication ceremony.
@@ -183,6 +191,14 @@ pub struct AuthenticationResult {
     /// Whether the authenticator signalled that the user was verified
     /// (biometric check, PIN, etc.) — corresponds to the UV flag.
     pub user_verified: bool,
+
+    /// Whether the credential is eligible for backup (BE flag).
+    /// Should remain constant across authentications for a given credential.
+    pub backup_eligible: bool,
+
+    /// Whether the credential is currently backed up (BS flag).
+    /// May change between ceremonies as backup state varies.
+    pub backup_state: bool,
 }
 
 /// The level of attestation the authenticator provided.
