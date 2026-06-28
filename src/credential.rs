@@ -16,25 +16,36 @@ use crate::error::{Result, WebAuthnError};
 /// - **RS256** — RSA PKCS#1 v1.5 with SHA-256 (COSE alg `-257`). Used by
 ///   older YubiKey 4-series devices and Windows Hello.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PublicKey {
     /// P-256 ECDSA public key (COSE alg `-7`, kty `2`).
     ///
     /// `x` and `y` are the 32-byte affine coordinates of the public point.
     /// To obtain the 65-byte uncompressed point for ring, prepend `0x04`:
     /// `0x04 || x (32 bytes) || y (32 bytes)`.
-    ES256 { x: Vec<u8>, y: Vec<u8> },
+    ES256 {
+        #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
+        x: Vec<u8>,
+        #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
+        y: Vec<u8>,
+    },
 
     /// Ed25519 EdDSA public key (COSE alg `-8`, kty `1` OKP).
     ///
     /// The inner `Vec<u8>` is the raw 32-byte Ed25519 public key,
     /// as encoded in COSE OKP key parameter `-2` (`x`).
-    EdDSA(Vec<u8>),
+    EdDSA(#[cfg_attr(feature = "serde", serde(with = "serde_bytes"))] Vec<u8>),
 
     /// RSA PKCS#1 v1.5 SHA-256 public key (COSE alg `-257`, kty `3`).
     ///
     /// `n` is the big-endian modulus (256 bytes for a 2048-bit key).
     /// `e` is the big-endian public exponent (typically `[0x01, 0x00, 0x01]`).
-    RS256 { n: Vec<u8>, e: Vec<u8> },
+    RS256 {
+        #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
+        n: Vec<u8>,
+        #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
+        e: Vec<u8>,
+    },
 }
 
 impl PublicKey {
@@ -65,9 +76,11 @@ impl PublicKey {
 /// The caller is responsible for storing this in a durable, server-side store
 /// keyed by `id` (the credential ID) and associated with `user_id`.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Credential {
     /// Opaque byte string that uniquely identifies this credential.
     /// Produced by the authenticator during registration.
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub id: Vec<u8>,
 
     /// The authenticator's public key in the format signalled during registration.
@@ -78,6 +91,7 @@ pub struct Credential {
     pub sign_count: u32,
 
     /// Application-defined identifier for the user this credential belongs to.
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub user_id: Vec<u8>,
 
     /// Relying party ID (e.g. `"example.com"`).
@@ -122,8 +136,10 @@ pub struct AuthenticatorAttestationResponse {
 /// expire after a short window (typically 60–300 seconds). The caller is
 /// responsible for enforcing both properties.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Challenge {
     /// 32 cryptographically random bytes.
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub bytes: Vec<u8>,
 
     /// When this challenge was generated — used for expiry checks.
@@ -168,6 +184,7 @@ impl Challenge {
 
 /// Successful outcome of a registration ceremony.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RegistrationResult {
     /// The newly registered credential — persist this in your database.
     pub credential: Credential,
@@ -186,8 +203,10 @@ pub struct RegistrationResult {
 
 /// Successful outcome of an authentication ceremony.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AuthenticationResult {
     /// The credential ID used to authenticate.
+    #[cfg_attr(feature = "serde", serde(with = "serde_bytes"))]
     pub credential_id: Vec<u8>,
 
     /// The sign count returned by the authenticator this ceremony.
@@ -213,6 +232,7 @@ pub struct AuthenticationResult {
 
 /// The level of attestation the authenticator provided.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AttestationType {
     /// The authenticator explicitly provided no attestation (`"fmt": "none"`).
     /// The credential is still usable, but device provenance cannot be verified.
@@ -227,4 +247,98 @@ pub enum AttestationType {
     /// this library (no trust-anchor set or FIDO MDS integration). The credential
     /// is accepted, but device provenance is unverified.
     Basic,
+}
+
+// ─── Serde round-trip tests ───────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::*;
+
+    fn epoch_plus(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn challenge_round_trips() {
+        let c = Challenge {
+            bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            created_at: epoch_plus(1_700_000_000),
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Challenge = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.bytes, c.bytes);
+        assert_eq!(back.created_at, c.created_at);
+    }
+
+    #[test]
+    fn public_key_es256_round_trips() {
+        let key = PublicKey::ES256 {
+            x: vec![0x01u8; 32],
+            y: vec![0x02u8; 32],
+        };
+        let json = serde_json::to_string(&key).unwrap();
+        let back: PublicKey = serde_json::from_str(&json).unwrap();
+        match back {
+            PublicKey::ES256 { x, y } => {
+                assert_eq!(x, vec![0x01u8; 32]);
+                assert_eq!(y, vec![0x02u8; 32]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn public_key_eddsa_round_trips() {
+        let key = PublicKey::EdDSA(vec![0x03u8; 32]);
+        let json = serde_json::to_string(&key).unwrap();
+        let back: PublicKey = serde_json::from_str(&json).unwrap();
+        match back {
+            PublicKey::EdDSA(bytes) => assert_eq!(bytes, vec![0x03u8; 32]),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn public_key_rs256_round_trips() {
+        let key = PublicKey::RS256 {
+            n: vec![0x04u8; 256],
+            e: vec![0x01, 0x00, 0x01],
+        };
+        let json = serde_json::to_string(&key).unwrap();
+        let back: PublicKey = serde_json::from_str(&json).unwrap();
+        match back {
+            PublicKey::RS256 { n, e } => {
+                assert_eq!(n, vec![0x04u8; 256]);
+                assert_eq!(e, vec![0x01, 0x00, 0x01]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn credential_round_trips() {
+        let cred = Credential {
+            id: vec![0xAAu8; 16],
+            public_key: PublicKey::ES256 {
+                x: vec![0x01u8; 32],
+                y: vec![0x02u8; 32],
+            },
+            sign_count: 42,
+            user_id: vec![0xBBu8; 8],
+            rp_id: "example.com".to_string(),
+            created_at: epoch_plus(1_700_000_000),
+            backup_eligible: true,
+        };
+        let json = serde_json::to_string(&cred).unwrap();
+        let back: Credential = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, cred.id);
+        assert_eq!(back.sign_count, cred.sign_count);
+        assert_eq!(back.user_id, cred.user_id);
+        assert_eq!(back.rp_id, cred.rp_id);
+        assert_eq!(back.created_at, cred.created_at);
+        assert_eq!(back.backup_eligible, cred.backup_eligible);
+    }
 }
