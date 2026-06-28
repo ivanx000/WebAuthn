@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`serde` feature flag** — opt-in `Serialize` + `Deserialize` derives on all
+  public types: `Credential`, `PublicKey`, `Challenge`, `RegistrationResult`,
+  `AuthenticationResult`, `AttestationType`, and `WebAuthnError`. Enable with
+  `features = ["serde"]` in `Cargo.toml`. `Vec<u8>` fields use
+  `serde_bytes` so they round-trip as compact byte sequences (base64 in JSON)
+  rather than arrays of integers. `serde` itself remains an unconditional
+  dependency (used internally for `clientDataJSON` parsing); only the public-type
+  derives are gated behind the feature. New optional dependency: `serde_bytes 0.11`.
+
+---
+
 ## [0.4.0] — 2026-06-27
 
 ### Added
