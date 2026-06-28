@@ -98,9 +98,9 @@ AuthenticatorAttestationResponse
                             ├─ kty=2 (EC2): x, y → 0x04 || x || y → PublicKey::ES256
                             └─ kty=3 (RSA): n, e → PublicKey::RS256
 
-→ attestation::verify(fmt, ...)   ["none", "packed", "fido-u2f", "android-key"]
-→ Credential { id, public_key, sign_count, user_id, rp_id, created_at }
-→ RegistrationResult { credential, attestation_type }
+→ attestation::verify(fmt, ...)   ["none", "packed", "fido-u2f", "android-key", "apple"]
+→ Credential { id, public_key, sign_count, user_id, rp_id, created_at, backup_eligible }
+→ RegistrationResult { credential, attestation_type, backup_eligible, backup_state }
 ```
 
 ## Data flow: authentication
@@ -133,7 +133,8 @@ Stored Credential + AuthenticatorAssertionResponse
                │
         return AuthenticationResult {
           credential_id, new_sign_count,
-          user_present, user_verified
+          user_present, user_verified,
+          backup_eligible, backup_state
         }
 ```
 
@@ -259,5 +260,4 @@ Every error in this library follows three rules:
 - **ES384 / ES512** — not supported; would require P-384/P-521 ring API.
 - **Extension data** — authenticator data extensions are silently ignored.
 - **Token binding** — not checked.
-- **`crossOrigin` enforcement** — the `crossOrigin: true` case is accepted, which
-  some relying parties should reject.
+- **`crossOrigin` strict mode** — accepted by default. Enable `RelyingParty::reject_cross_origin(true)` to reject assertions with `crossOrigin: true` in `clientDataJSON` (§7.1 step 10 / §7.2 step 12).
