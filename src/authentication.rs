@@ -198,5 +198,6 @@ fn verify_authentication_inner(
         user_verified: auth_data.flags.user_verified,
         backup_eligible: auth_data.flags.backup_eligible,
         backup_state: auth_data.flags.backup_state,
+        extensions: auth_data.extensions,
     })
 }

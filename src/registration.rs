@@ -413,6 +413,7 @@ fn verify_registration_inner(
 
     let backup_eligible = auth_data.flags.backup_eligible;
     let backup_state = auth_data.flags.backup_state;
+    let extensions = auth_data.extensions;
 
     // ── §7.1 step 25 ──────────────────────────────────────────────────────────
     // Build the Credential. The caller must persist this object.
@@ -432,6 +433,7 @@ fn verify_registration_inner(
         attestation_type,
         backup_eligible,
         backup_state,
+        extensions,
     })
 }
 
