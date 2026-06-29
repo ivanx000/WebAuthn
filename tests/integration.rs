@@ -2310,6 +2310,139 @@ fn allowlist_es256_and_rs256_accepts_both() {
         .expect("ES256+RS256 allowlist should accept RS256");
 }
 
+// ─── Extension data tests (§6.1 / §10.5) ─────────────────────────────────────
+
+#[test]
+fn registration_with_extension_data_exposes_extensions() {
+    // Build auth data with AT + ED flags; append a CBOR extension map after the COSE key.
+    let fixture = Fixture::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
+
+    let cose_cbor = encode_cose_key(&fixture.public_key_bytes);
+    // credProps extension: {"rk": true}
+    let cred_props = Value::Map(vec![(Value::Text("rk".to_string()), Value::Bool(true))]);
+    let ext_map = Value::Map(vec![(
+        Value::Text("credProps".to_string()),
+        cred_props.clone(),
+    )]);
+    let mut ext_bytes = Vec::new();
+    ciborium::into_writer(&ext_map, &mut ext_bytes).unwrap();
+
+    // aaguid(16) + credentialIdLength(2) + credentialId + COSE key + extension map
+    let mut at_section = vec![0u8; 16]; // aaguid
+    at_section.extend_from_slice(&(fixture.cred_id.len() as u16).to_be_bytes());
+    at_section.extend_from_slice(&fixture.cred_id);
+    at_section.extend_from_slice(&cose_cbor);
+    at_section.extend_from_slice(&ext_bytes);
+
+    let auth_data = {
+        let rp_hash = webauthn::crypto::sha256(RP_ID.as_bytes());
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&rp_hash);
+        buf.push(0xC1); // UP (0x01) | AT (0x40) | ED (0x80)
+        buf.extend_from_slice(&1u32.to_be_bytes()); // sign_count
+        buf.extend_from_slice(&at_section);
+        buf
+    };
+
+    let challenge = Challenge::new().unwrap();
+    let client_data_json = make_client_data_json_bytes("webauthn.create", &challenge.bytes, ORIGIN);
+    let att_obj = make_attestation_object(&auth_data, "none");
+
+    let response = AuthenticatorAttestationResponse {
+        client_data_json,
+        attestation_object: att_obj,
+    };
+    let result = rp
+        .verify_registration(&challenge, &response, b"uid")
+        .expect("registration with extension data should succeed");
+
+    let exts = result.extensions.expect("extensions must be populated");
+    assert_eq!(exts.get("credProps"), Some(&cred_props));
+}
+
+#[test]
+fn authentication_with_extension_data_exposes_extensions() {
+    let fixture = Fixture::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
+
+    // Register first (no extensions during registration).
+    let reg_challenge = Challenge::new().unwrap();
+    let reg_response = fixture.make_registration_response(
+        &reg_challenge.bytes,
+        "webauthn.create",
+        ORIGIN,
+        RP_ID,
+        0x41,
+        1,
+        "none",
+    );
+    let credential = rp
+        .verify_registration(&reg_challenge, &reg_response, b"uid")
+        .unwrap()
+        .credential;
+
+    // Build assertion auth data with ED flag set and an appid extension.
+    let ext_map = Value::Map(vec![(Value::Text("appid".to_string()), Value::Bool(true))]);
+    let mut ext_bytes = Vec::new();
+    ciborium::into_writer(&ext_map, &mut ext_bytes).unwrap();
+
+    let auth_data_bytes = {
+        let rp_hash = webauthn::crypto::sha256(RP_ID.as_bytes());
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&rp_hash);
+        buf.push(0x81); // UP (0x01) | ED (0x80)
+        buf.extend_from_slice(&2u32.to_be_bytes()); // sign_count > stored (1)
+        buf.extend_from_slice(&ext_bytes);
+        buf
+    };
+
+    let client_data_bytes =
+        make_client_data_json_bytes("webauthn.get", &reg_challenge.bytes, ORIGIN);
+    let auth_challenge = Challenge {
+        bytes: reg_challenge.bytes.clone(),
+        created_at: std::time::SystemTime::now(),
+    };
+    let client_data_hash = webauthn::crypto::sha256(&client_data_bytes);
+    let mut signed_data = auth_data_bytes.clone();
+    signed_data.extend_from_slice(&client_data_hash);
+    let sig = fixture.key_pair.sign(&fixture.rng, &signed_data).unwrap();
+
+    let auth_response = AuthenticatorAssertionResponse {
+        client_data_json: client_data_bytes,
+        authenticator_data: auth_data_bytes,
+        signature: sig.as_ref().to_vec(),
+        user_handle: None,
+    };
+
+    let result = rp
+        .verify_authentication(&credential, &auth_challenge, &auth_response)
+        .expect("authentication with extension data should succeed");
+
+    let exts = result.extensions.expect("extensions must be populated");
+    assert_eq!(exts.get("appid"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn registration_without_extension_data_has_none_extensions() {
+    let fixture = Fixture::new();
+    let rp = RelyingParty::new(RP_ID, ORIGIN, "Test RP");
+    let challenge = Challenge::new().unwrap();
+    let response = fixture.make_registration_response(
+        &challenge.bytes,
+        "webauthn.create",
+        ORIGIN,
+        RP_ID,
+        0x41, // UP + AT, no ED
+        1,
+        "none",
+    );
+    let result = rp
+        .verify_registration(&challenge, &response, b"uid")
+        .unwrap();
+    assert!(result.extensions.is_none());
+}
+
 // ─── Multi-origin tests ───────────────────────────────────────────────────────
 
 #[test]
