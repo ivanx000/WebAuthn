@@ -286,7 +286,7 @@ Canonical spec: https://www.w3.org/TR/webauthn-3/
 | Packed basic attestation cert chain | `x5c` detected, `AttestationType::Basic` returned; chain not verified (no MDS) |
 | FIDO U2F cert chain | Signature verified, cert chain not verified (no MDS trust anchors) |
 | Android Key cert chain | Signature + key-match verified, cert chain not verified (no MDS trust anchors) |
-| `"tpm"` attestation | Not implemented |
+| TPM cert chain | sig + certInfo + pubArea verified; cert chain not verified (no MDS trust anchors) |
 | Apple cert chain | Nonce + key-match verified; cert chain not verified (no Apple MDS trust anchors) |
 | Extension data ignored | The extensions section of authenticator data is parsed but silently skipped |
 | Challenge single-use enforcement | The caller is responsible — the library does not maintain a used-challenge set |
@@ -508,7 +508,14 @@ crate. All security-critical operations remain inside `ring`'s audited boundary.
   the Apple nonce extension (OID 1.2.840.113635.100.8.2) whose value equals
   SHA-256(`authData || clientDataHash`). The cert's EC P-256 public key must equal
   the credential public key. Returns `AttestationType::Basic`. Certificate chain not verified.
-- Other formats (`"tpm"`, etc.): accepted with `AttestationType::None`
+- **TPM** (`"tpm"`): `ver` must be `"2.0"`, `alg` must match the credential key,
+  `x5c` is required. `sig` is verified over the raw `certInfo` bytes using the
+  AIK cert's public key. `certInfo` (TPM2B_ATTEST) is parsed to verify `magic`,
+  `type`, `extraData` (= SHA-256(authData || clientDataHash)), and
+  `attested.name` (= nameAlg_bytes || H_nameAlg(pubArea)). `pubArea` key
+  coordinates are compared against the credential key. Returns
+  `AttestationType::Basic`. Certificate chain not verified.
+- Other formats: accepted with `AttestationType::None`
   (provenance unverifiable but credential usable).
 
 `parse_attestation_object` in `registration.rs` was updated to return the `attStmt`

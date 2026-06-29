@@ -12,7 +12,7 @@
 //! | `"packed"`        | ✅ Self-attestation; ⚠️ Basic detected  | Self: signature verified. Basic: cert chain skipped      |
 //! | `"fido-u2f"`      | ✅ Supported                            | Signature verified; cert chain requires FIDO MDS         |
 //! | `"android-key"`   | ✅ Supported                            | Signature + key-match verified; cert chain skipped       |
-//! | `"tpm"`           | ❌ Not supported                        | Requires TPM certificate chain                           |
+//! | `"tpm"`           | ✅ Supported                            | sig + certInfo + pubArea verified; cert chain skipped    |
 //! | `"apple"`         | ✅ Supported                            | Nonce + key-match verified; cert chain requires Apple MDS |
 //!
 //! ### Packed attestation sub-cases
@@ -26,6 +26,7 @@
 //! - **ECDAA**: deprecated and not implemented.
 
 use ciborium::value::Value;
+use ring::digest;
 
 use crate::algorithm::{COSE_EDDSA, COSE_ES256, COSE_RS256};
 use crate::credential::{AttestationType, PublicKey};
@@ -95,9 +96,15 @@ pub fn verify(
             credential_public_key,
         ),
 
-        // All other formats (tpm) require certificate chain validation against
-        // the FIDO Metadata Service — out of scope.
-        // Accept the credential but signal that attestation was not verified.
+        // §8.3 — tpm attestation: TPM 2.0 certify attestation.
+        "tpm" => verify_tpm(
+            att_stmt,
+            auth_data_bytes,
+            client_data_hash,
+            credential_public_key,
+        ),
+
+        // All other formats are accepted but signal that attestation was not verified.
         _other => Ok(AttestationType::None),
     }
 }
@@ -573,6 +580,517 @@ fn verify_apple(
     Ok(AttestationType::Basic)
 }
 
+/// Verify a TPM attestation statement (W3C WebAuthn §8.3).
+///
+/// Requires `ver = "2.0"`, `alg` matching the credential key algorithm, and
+/// `x5c` with an AIK (attestation identity key) certificate. Parses and
+/// validates `certInfo` (TPM2B_ATTEST), verifies that `pubArea` encodes the
+/// same public key as the credential, and verifies `sig` over the raw
+/// `certInfo` bytes using the attestation certificate's public key.
+/// Returns [`AttestationType::Basic`] on success. The certificate chain is not
+/// verified — that requires a FIDO MDS trust anchor set.
+fn verify_tpm(
+    att_stmt: &Value,
+    auth_data_bytes: &[u8],
+    client_data_hash: &[u8; 32],
+    credential_public_key: &PublicKey,
+) -> Result<AttestationType> {
+    let stmt_map = match att_stmt {
+        Value::Map(m) => m,
+        _ => {
+            return Err(WebAuthnError::InvalidAttestationObject(
+                "tpm attStmt must be a CBOR map".to_string(),
+            ))
+        }
+    };
+
+    let mut ver: Option<String> = None;
+    let mut alg: Option<i64> = None;
+    let mut sig: Option<Vec<u8>> = None;
+    let mut x5c_first_cert: Option<Vec<u8>> = None;
+    let mut cert_info: Option<Vec<u8>> = None;
+    let mut pub_area: Option<Vec<u8>> = None;
+
+    for (k, v) in stmt_map {
+        match k {
+            Value::Text(ref key) if key == "ver" => {
+                ver = Some(match v {
+                    Value::Text(s) => s.clone(),
+                    _ => {
+                        return Err(WebAuthnError::InvalidAttestationObject(
+                            "tpm attStmt ver must be a CBOR text string".to_string(),
+                        ))
+                    }
+                });
+            }
+            Value::Text(ref key) if key == "alg" => {
+                alg = Some(match v {
+                    Value::Integer(i) => i64::try_from(*i).map_err(|_| {
+                        WebAuthnError::InvalidAttestationObject(
+                            "tpm attStmt alg value out of i64 range".to_string(),
+                        )
+                    })?,
+                    _ => {
+                        return Err(WebAuthnError::InvalidAttestationObject(
+                            "tpm attStmt alg must be a CBOR integer".to_string(),
+                        ))
+                    }
+                });
+            }
+            Value::Text(ref key) if key == "sig" => {
+                sig = Some(match v {
+                    Value::Bytes(b) => b.clone(),
+                    _ => {
+                        return Err(WebAuthnError::InvalidAttestationObject(
+                            "tpm attStmt sig must be CBOR bytes".to_string(),
+                        ))
+                    }
+                });
+            }
+            Value::Text(ref key) if key == "x5c" => {
+                x5c_first_cert = Some(match v {
+                    Value::Array(certs) if !certs.is_empty() => match &certs[0] {
+                        Value::Bytes(b) => b.clone(),
+                        _ => {
+                            return Err(WebAuthnError::InvalidAttestationObject(
+                                "tpm x5c[0] must be CBOR bytes".to_string(),
+                            ))
+                        }
+                    },
+                    Value::Array(_) => {
+                        return Err(WebAuthnError::InvalidAttestationObject(
+                            "tpm x5c must be non-empty".to_string(),
+                        ))
+                    }
+                    _ => {
+                        return Err(WebAuthnError::InvalidAttestationObject(
+                            "tpm x5c must be a CBOR array".to_string(),
+                        ))
+                    }
+                });
+            }
+            Value::Text(ref key) if key == "certInfo" => {
+                cert_info = Some(match v {
+                    Value::Bytes(b) => b.clone(),
+                    _ => {
+                        return Err(WebAuthnError::InvalidAttestationObject(
+                            "tpm attStmt certInfo must be CBOR bytes".to_string(),
+                        ))
+                    }
+                });
+            }
+            Value::Text(ref key) if key == "pubArea" => {
+                pub_area = Some(match v {
+                    Value::Bytes(b) => b.clone(),
+                    _ => {
+                        return Err(WebAuthnError::InvalidAttestationObject(
+                            "tpm attStmt pubArea must be CBOR bytes".to_string(),
+                        ))
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // §8.3 step 1: ver must be "2.0" — only TPM 2.0 is relevant for WebAuthn.
+    let ver = ver.ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(
+            "tpm attStmt missing required field: ver".to_string(),
+        )
+    })?;
+    if ver != "2.0" {
+        return Err(WebAuthnError::InvalidAttestationObject(format!(
+            "tpm: ver must be \"2.0\", got \"{ver}\""
+        )));
+    }
+
+    // §8.3 step 1 (alg): alg must match the credential public key's COSE algorithm.
+    let alg = alg.ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(
+            "tpm attStmt missing required field: alg".to_string(),
+        )
+    })?;
+    let expected_alg = credential_public_key.algorithm();
+    if alg != expected_alg {
+        return Err(WebAuthnError::InvalidAttestationObject(format!(
+            "tpm: attStmt alg ({alg}) does not match credential key algorithm ({expected_alg})"
+        )));
+    }
+
+    // §8.3 step 1 (x5c): x5c must be present — ECDAA is deprecated and unsupported.
+    let cert_der = x5c_first_cert.ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(
+            "tpm attStmt missing required field: x5c (ECDAA is not supported)".to_string(),
+        )
+    })?;
+    let sig = sig.ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(
+            "tpm attStmt missing required field: sig".to_string(),
+        )
+    })?;
+    let cert_info = cert_info.ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(
+            "tpm attStmt missing required field: certInfo".to_string(),
+        )
+    })?;
+    let pub_area = pub_area.ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(
+            "tpm attStmt missing required field: pubArea".to_string(),
+        )
+    })?;
+
+    // §8.3 step 1: extract the AIK certificate's public key, keyed by alg.
+    // The cert key may differ from the credential key but must match alg.
+    let cert_key_bytes = match alg {
+        COSE_ES256 => extract_ec_p256_public_key_from_cert(&cert_der)?,
+        COSE_RS256 => extract_rsa_public_key_der_from_cert(&cert_der)?,
+        _ => return Err(WebAuthnError::UnsupportedAlgorithm(alg)),
+    };
+
+    // §8.3 step 3: attToBeSigned = authData || clientDataHash.
+    // extraData in certInfo must equal SHA-256(attToBeSigned).
+    let mut att_to_be_signed = Vec::with_capacity(auth_data_bytes.len() + 32);
+    att_to_be_signed.extend_from_slice(auth_data_bytes);
+    att_to_be_signed.extend_from_slice(client_data_hash);
+    let expected_extra_data = crate::crypto::sha256(&att_to_be_signed);
+
+    // Compute name(pubArea) = nameAlg_bytes || H_nameAlg(pubArea).
+    // Used to verify certInfo.attested.name in step 4.d.
+    let expected_name = compute_pub_area_name(&pub_area)?;
+
+    // §8.3 step 2: verify that pubArea encodes the same public key as the credential.
+    verify_pub_area_matches_credential(&pub_area, credential_public_key)?;
+
+    // §8.3 step 4.a–d: parse and validate certInfo (TPM2B_ATTEST).
+    verify_cert_info(&cert_info, &expected_extra_data, &expected_name)?;
+
+    // §8.3 step 5: verify sig over the raw certInfo bytes using the AIK cert key.
+    match alg {
+        COSE_ES256 => verify_es256(&cert_key_bytes, &cert_info, &sig)?,
+        COSE_RS256 => verify_rs256(&cert_key_bytes, &cert_info, &sig)?,
+        // SAFETY: alg was already validated to be ES256 or RS256 in the match above.
+        _ => unreachable!("alg validated earlier"),
+    }
+
+    Ok(AttestationType::Basic)
+}
+
+/// Compute the TPM name for a raw `pubArea` blob.
+///
+/// `name = nameAlg_bytes (2 bytes, big-endian) || H_nameAlg(pubArea)`.
+/// `nameAlg` is read from bytes 2–3 of `pubArea` (the `TPMT_PUBLIC.nameAlg`
+/// field). Supported values: `0x000B` (TPM_ALG_SHA256), `0x000C` (TPM_ALG_SHA384).
+fn compute_pub_area_name(pub_area: &[u8]) -> Result<Vec<u8>> {
+    if pub_area.len() < 4 {
+        return Err(WebAuthnError::InvalidAttestationObject(
+            "tpm: pubArea too short to read nameAlg (need at least 4 bytes)".to_string(),
+        ));
+    }
+    let name_alg = u16::from_be_bytes([pub_area[2], pub_area[3]]);
+    let hash: Vec<u8> = match name_alg {
+        0x000B => crate::crypto::sha256(pub_area).to_vec(),
+        0x000C => {
+            // TPM_ALG_SHA384 — used when nameAlg selects P-384 or larger curve.
+            digest::digest(&digest::SHA384, pub_area).as_ref().to_vec()
+        }
+        other => {
+            return Err(WebAuthnError::InvalidAttestationObject(format!(
+                "tpm: unsupported pubArea nameAlg 0x{other:04X} \
+                 (expected 0x000B SHA-256 or 0x000C SHA-384)"
+            )))
+        }
+    };
+    // name = nameAlg (2 bytes, big-endian) || H_nameAlg(pubArea)
+    let mut name = vec![pub_area[2], pub_area[3]];
+    name.extend_from_slice(&hash);
+    Ok(name)
+}
+
+/// Verify that `pubArea` (`TPMT_PUBLIC`) encodes the same public key as `credential_public_key`.
+///
+/// Parses the binary layout of `TPMT_PUBLIC` to locate the `unique` field
+/// (TPMS_ECC_POINT for ECC keys, TPM2B_PUBLIC_KEY_RSA for RSA) and compares
+/// the raw key material against the stored credential.
+fn verify_pub_area_matches_credential(
+    pub_area: &[u8],
+    credential_public_key: &PublicKey,
+) -> Result<()> {
+    if pub_area.len() < 10 {
+        return Err(WebAuthnError::InvalidAttestationObject(
+            "tpm: pubArea too short (need at least 10 bytes for the fixed header)".to_string(),
+        ));
+    }
+
+    let key_type = u16::from_be_bytes([pub_area[0], pub_area[1]]);
+    // authPolicy is a variable-length blob at offset 8; its 2-byte length prefix determines
+    // where the `parameters` field starts.
+    let auth_policy_size = u16::from_be_bytes([pub_area[8], pub_area[9]]) as usize;
+    let params_start = 10_usize.checked_add(auth_policy_size).ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject("tpm: pubArea authPolicy size overflow".to_string())
+    })?;
+
+    match key_type {
+        // ECC: TPMS_ECC_PARMS = 4 (sym) + 2 (scheme) + 2 (curveID) + 2 (kdf) = 10 bytes.
+        // unique = TPMS_ECC_POINT: x (2-byte length-prefixed) || y (2-byte length-prefixed).
+        0x0023 => {
+            let unique_start = params_start.checked_add(10).ok_or_else(|| {
+                WebAuthnError::InvalidAttestationObject(
+                    "tpm: pubArea ECC params offset overflow".to_string(),
+                )
+            })?;
+            let mut pos = unique_start;
+            let x = tpm_read_blob(pub_area, &mut pos)?;
+            let y = tpm_read_blob(pub_area, &mut pos)?;
+            match credential_public_key {
+                PublicKey::ES256 { x: cx, y: cy } => {
+                    if x != cx.as_slice() || y != cy.as_slice() {
+                        return Err(WebAuthnError::InvalidAttestationObject(
+                            "tpm: pubArea ECC point does not match ES256 credential key"
+                                .to_string(),
+                        ));
+                    }
+                }
+                PublicKey::ES384 { x: cx, y: cy } => {
+                    if x != cx.as_slice() || y != cy.as_slice() {
+                        return Err(WebAuthnError::InvalidAttestationObject(
+                            "tpm: pubArea ECC point does not match ES384 credential key"
+                                .to_string(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(WebAuthnError::InvalidAttestationObject(
+                        "tpm: pubArea type is ECC (0x0023) but credential key is not an EC key"
+                            .to_string(),
+                    ))
+                }
+            }
+        }
+        // RSA: TPMS_RSA_PARMS = 4 (sym) + 2 (scheme) + 2 (keyBits) + 4 (exponent) = 12 bytes.
+        // unique = TPM2B_PUBLIC_KEY_RSA: 2-byte-length-prefixed modulus.
+        0x0001 => {
+            let unique_start = params_start.checked_add(12).ok_or_else(|| {
+                WebAuthnError::InvalidAttestationObject(
+                    "tpm: pubArea RSA params offset overflow".to_string(),
+                )
+            })?;
+            let mut pos = unique_start;
+            let tpm_modulus = tpm_read_blob(pub_area, &mut pos)?;
+            match credential_public_key {
+                PublicKey::RS256 { n, .. } => {
+                    // Strip leading 0x00 bytes from both sides before comparing: the TPM
+                    // encodes the modulus without a DER sign-extension byte, but the DER
+                    // INTEGER `n` from COSE may carry a leading 0x00 if the high bit is set.
+                    fn strip(b: &[u8]) -> &[u8] {
+                        let start = b.iter().position(|v| *v != 0).unwrap_or(b.len());
+                        &b[start..]
+                    }
+                    if strip(tpm_modulus) != strip(n) {
+                        return Err(WebAuthnError::InvalidAttestationObject(
+                            "tpm: pubArea RSA modulus does not match RS256 credential key"
+                                .to_string(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(WebAuthnError::InvalidAttestationObject(
+                        "tpm: pubArea type is RSA (0x0001) but credential key is not RS256"
+                            .to_string(),
+                    ))
+                }
+            }
+        }
+        other => {
+            return Err(WebAuthnError::InvalidAttestationObject(format!(
+                "tpm: unsupported pubArea key type: 0x{other:04X}"
+            )))
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse and validate a `certInfo` (`TPM2B_ATTEST`) blob (§8.3 step 4).
+///
+/// Checks magic, type, extraData, and attested.name. The signature over this
+/// blob is verified separately in step 5.
+fn verify_cert_info(
+    cert_info: &[u8],
+    expected_extra_data: &[u8; 32],
+    expected_name: &[u8],
+) -> Result<()> {
+    let mut pos = 0usize;
+
+    // §8.3 step 4: TPM2B_ATTEST starts with a 2-byte size field (TPMS_ATTEST length).
+    tpm_skip(cert_info, &mut pos, 2)?;
+
+    // §8.3 step 4.a: magic must be TPM_GENERATED_VALUE (0xFF544347).
+    let magic = tpm_read_u32_be(cert_info, &mut pos)?;
+    if magic != 0xFF544347 {
+        return Err(WebAuthnError::InvalidAttestationObject(format!(
+            "tpm: certInfo magic must be 0xFF544347 (TPM_GENERATED_VALUE), got 0x{magic:08X}"
+        )));
+    }
+
+    // §8.3 step 4.b: type must be TPM_ST_ATTEST_CERTIFY (0x8017).
+    let attest_type = tpm_read_u16_be(cert_info, &mut pos)?;
+    if attest_type != 0x8017 {
+        return Err(WebAuthnError::InvalidAttestationObject(format!(
+            "tpm: certInfo type must be 0x8017 (TPM_ST_ATTEST_CERTIFY), got 0x{attest_type:04X}"
+        )));
+    }
+
+    // qualifiedSigner (2-byte length-prefixed blob) — skip without verification.
+    let _ = tpm_read_blob(cert_info, &mut pos)?;
+
+    // §8.3 step 4.c: extraData must equal SHA-256(authData || clientDataHash).
+    let extra_data = tpm_read_blob(cert_info, &mut pos)?;
+    if extra_data != expected_extra_data.as_slice() {
+        return Err(WebAuthnError::InvalidAttestationObject(
+            "tpm: certInfo extraData does not match SHA-256(authData || clientDataHash)"
+                .to_string(),
+        ));
+    }
+
+    // clockInfo (8 bytes) and firmwareVersion (8 bytes) — skip without verification.
+    tpm_skip(cert_info, &mut pos, 16)?;
+
+    // §8.3 step 4.d: attested.name must equal name(pubArea).
+    let attested_name = tpm_read_blob(cert_info, &mut pos)?;
+    if attested_name != expected_name {
+        return Err(WebAuthnError::InvalidAttestationObject(
+            "tpm: certInfo attested.name does not match computed name(pubArea)".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Read a big-endian `u16` from `data[*pos..*pos+2]` and advance `*pos` by 2.
+fn tpm_read_u16_be(data: &[u8], pos: &mut usize) -> Result<u16> {
+    let end = pos.checked_add(2).ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject("tpm: position overflow reading u16".to_string())
+    })?;
+    let bytes: [u8; 2] = data
+        .get(*pos..end)
+        .ok_or_else(|| {
+            WebAuthnError::InvalidAttestationObject("tpm: buffer too short reading u16".to_string())
+        })?
+        // Slice is exactly 2 bytes as guaranteed by the checked_add above.
+        .try_into()
+        .expect("slice is exactly 2 bytes");
+    *pos = end;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+/// Read a big-endian `u32` from `data[*pos..*pos+4]` and advance `*pos` by 4.
+fn tpm_read_u32_be(data: &[u8], pos: &mut usize) -> Result<u32> {
+    let end = pos.checked_add(4).ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject("tpm: position overflow reading u32".to_string())
+    })?;
+    let bytes: [u8; 4] = data
+        .get(*pos..end)
+        .ok_or_else(|| {
+            WebAuthnError::InvalidAttestationObject("tpm: buffer too short reading u32".to_string())
+        })?
+        // Slice is exactly 4 bytes as guaranteed by the checked_add above.
+        .try_into()
+        .expect("slice is exactly 4 bytes");
+    *pos = end;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+/// Read a 2-byte-length-prefixed blob from `data` at `*pos` and advance `*pos`.
+fn tpm_read_blob<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
+    let len = tpm_read_u16_be(data, pos)? as usize;
+    let end = pos.checked_add(len).ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(
+            "tpm: position overflow reading length-prefixed blob".to_string(),
+        )
+    })?;
+    let slice = data.get(*pos..end).ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(
+            "tpm: length-prefixed field extends beyond buffer".to_string(),
+        )
+    })?;
+    *pos = end;
+    Ok(slice)
+}
+
+/// Skip `n` bytes in `data` at `*pos` and advance `*pos`.
+fn tpm_skip(data: &[u8], pos: &mut usize, n: usize) -> Result<()> {
+    let end = pos.checked_add(n).ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(format!(
+            "tpm: position overflow skipping {n} bytes"
+        ))
+    })?;
+    if end > data.len() {
+        return Err(WebAuthnError::InvalidAttestationObject(format!(
+            "tpm: buffer too short skipping {n} bytes (have {}, need {end})",
+            data.len()
+        )));
+    }
+    *pos = end;
+    Ok(())
+}
+
+/// Extract a DER-encoded `RSAPublicKey` (`SEQUENCE { INTEGER n, INTEGER e }`) from
+/// a DER-encoded X.509 certificate by navigating to the SubjectPublicKeyInfo.
+///
+/// Searches for the rsaEncryption OID (1.2.840.113549.1.1.1), skips the NULL
+/// AlgorithmIdentifier parameters, parses the BIT STRING, and returns the
+/// `RSAPublicKey` SEQUENCE contents — the format `ring`'s
+/// `RSA_PKCS1_2048_8192_SHA256` expects (`RSAPublicKey` per RFC 3447, not
+/// SubjectPublicKeyInfo).
+fn extract_rsa_public_key_der_from_cert(cert_der: &[u8]) -> Result<Vec<u8>> {
+    // OID 1.2.840.113549.1.1.1 (rsaEncryption) in DER.
+    const RSA_ENCRYPTION_OID: &[u8] = &[
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+    ];
+
+    let oid_pos = cert_der
+        .windows(RSA_ENCRYPTION_OID.len())
+        .position(|w| w == RSA_ENCRYPTION_OID)
+        .ok_or_else(|| {
+            WebAuthnError::InvalidAttestationObject(
+                "tpm: attestation cert does not contain rsaEncryption OID".to_string(),
+            )
+        })?;
+
+    let after_oid = &cert_der[oid_pos + RSA_ENCRYPTION_OID.len()..];
+
+    // Skip AlgorithmIdentifier parameters (typically NULL: 05 00).
+    let (_, _, after_params) = der_parse_tlv(after_oid).ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(
+            "tpm: failed to parse AlgorithmIdentifier params after rsaEncryption OID".to_string(),
+        )
+    })?;
+
+    // Parse the BIT STRING containing the RSAPublicKey SEQUENCE.
+    let (bs_tag, bs_content, _) = der_parse_tlv(after_params).ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(
+            "tpm: failed to parse SubjectPublicKeyInfo BIT STRING".to_string(),
+        )
+    })?;
+    if bs_tag != 0x03 {
+        return Err(WebAuthnError::InvalidAttestationObject(
+            "tpm: expected BIT STRING after AlgorithmIdentifier in SubjectPublicKeyInfo"
+                .to_string(),
+        ));
+    }
+
+    // The BIT STRING starts with an unused-bits byte (0x00 for all key types).
+    // The RSAPublicKey SEQUENCE { INTEGER n, INTEGER e } follows immediately.
+    let rsa_pk = bs_content.get(1..).ok_or_else(|| {
+        WebAuthnError::InvalidAttestationObject(
+            "tpm: BIT STRING for RSA public key is too short".to_string(),
+        )
+    })?;
+
+    Ok(rsa_pk.to_vec())
+}
+
 /// Extract the 32-byte nonce from the Apple attestation OID extension
 /// (OID 1.2.840.113635.100.8.2) in a DER-encoded X.509 certificate.
 ///
@@ -750,9 +1268,15 @@ mod tests {
 
     #[test]
     fn accepts_unknown_format_as_none() {
-        // Unsupported formats (tpm, apple) are accepted but return None.
         let pk = dummy_es256_key();
-        let result = verify("tpm", &none_att_stmt(), &[], &[0u8; 32], &pk, &[]);
+        let result = verify(
+            "unknown-format",
+            &none_att_stmt(),
+            &[],
+            &[0u8; 32],
+            &pk,
+            &[],
+        );
         assert!(matches!(result, Ok(AttestationType::None)));
     }
 
@@ -1446,6 +1970,682 @@ mod tests {
 
         let result = verify(
             "apple",
+            &stmt,
+            auth_data,
+            &client_data_hash,
+            &credential_public_key,
+            &[],
+        );
+        assert!(matches!(result, Ok(AttestationType::Basic)));
+    }
+
+    // ── tpm tests ────────────────────────────────────────────────────────────
+
+    fn build_tpm_ecc_pub_area(x: &[u8], y: &[u8]) -> Vec<u8> {
+        let mut pa = Vec::new();
+        pa.extend_from_slice(&[0x00, 0x23]); // type = ECC
+        pa.extend_from_slice(&[0x00, 0x0B]); // nameAlg = SHA-256
+        pa.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // objectAttributes
+        pa.extend_from_slice(&[0x00, 0x00]); // authPolicy size = 0
+                                             // TPMS_ECC_PARMS: sym(4) + scheme(2) + curveID P-256(2) + kdf(2) = 10 bytes
+        pa.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00]);
+        // unique = TPMS_ECC_POINT: x (2-byte length-prefixed) || y (2-byte length-prefixed)
+        pa.extend_from_slice(&(x.len() as u16).to_be_bytes());
+        pa.extend_from_slice(x);
+        pa.extend_from_slice(&(y.len() as u16).to_be_bytes());
+        pa.extend_from_slice(y);
+        pa
+    }
+
+    fn build_tpm_cert_info(extra_data: &[u8; 32], attested_name: &[u8]) -> Vec<u8> {
+        let mut attest = Vec::new();
+        attest.extend_from_slice(&[0xFF, 0x54, 0x43, 0x47]); // magic = TPM_GENERATED_VALUE
+        attest.extend_from_slice(&[0x80, 0x17]); // type = TPM_ST_ATTEST_CERTIFY
+        attest.extend_from_slice(&[0x00, 0x00]); // qualifiedSigner (empty)
+        attest.extend_from_slice(&(extra_data.len() as u16).to_be_bytes());
+        attest.extend_from_slice(extra_data);
+        attest.extend_from_slice(&[0u8; 8]); // clockInfo
+        attest.extend_from_slice(&[0u8; 8]); // firmwareVersion
+        attest.extend_from_slice(&(attested_name.len() as u16).to_be_bytes());
+        attest.extend_from_slice(attested_name);
+
+        let mut cert_info = Vec::new();
+        cert_info.extend_from_slice(&(attest.len() as u16).to_be_bytes()); // size
+        cert_info.extend_from_slice(&attest);
+        cert_info
+    }
+
+    #[test]
+    fn tpm_rejects_missing_ver() {
+        let pk = dummy_es256_key();
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(vec![0u8; 4])]),
+            ),
+            (
+                Value::Text("certInfo".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+            (
+                Value::Text("pubArea".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+        ]);
+        let result = verify("tpm", &stmt, &[], &[0u8; 32], &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("ver"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_wrong_ver() {
+        let pk = dummy_es256_key();
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("1.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(vec![0u8; 4])]),
+            ),
+            (
+                Value::Text("certInfo".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+            (
+                Value::Text("pubArea".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+        ]);
+        let result = verify("tpm", &stmt, &[], &[0u8; 32], &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("2.0"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_missing_alg() {
+        let pk = dummy_es256_key();
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(vec![0u8; 4])]),
+            ),
+            (
+                Value::Text("certInfo".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+            (
+                Value::Text("pubArea".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+        ]);
+        let result = verify("tpm", &stmt, &[], &[0u8; 32], &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("alg"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_alg_mismatch() {
+        // Credential is ES256 (-7) but attStmt claims RS256 (-257).
+        let pk = dummy_es256_key();
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-257i64).into()),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(vec![0u8; 4])]),
+            ),
+            (
+                Value::Text("certInfo".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+            (
+                Value::Text("pubArea".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+        ]);
+        let result = verify("tpm", &stmt, &[], &[0u8; 32], &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("alg"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_missing_x5c() {
+        let pk = dummy_es256_key();
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (
+                Value::Text("certInfo".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+            (
+                Value::Text("pubArea".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+        ]);
+        let result = verify("tpm", &stmt, &[], &[0u8; 32], &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("x5c"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_empty_x5c() {
+        let pk = dummy_es256_key();
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (Value::Text("x5c".to_string()), Value::Array(vec![])),
+            (
+                Value::Text("certInfo".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+            (
+                Value::Text("pubArea".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+        ]);
+        let result = verify("tpm", &stmt, &[], &[0u8; 32], &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("non-empty"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_missing_cert_info() {
+        let pk = dummy_es256_key();
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(vec![0u8; 4])]),
+            ),
+            (
+                Value::Text("pubArea".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+        ]);
+        let result = verify("tpm", &stmt, &[], &[0u8; 32], &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("certInfo"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_missing_pub_area() {
+        let pk = dummy_es256_key();
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(vec![0u8; 4])]),
+            ),
+            (
+                Value::Text("certInfo".to_string()),
+                Value::Bytes(vec![0u8; 4]),
+            ),
+        ]);
+        let result = verify("tpm", &stmt, &[], &[0u8; 32], &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("pubArea"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_bad_magic_in_cert_info() {
+        use ring::rand::SystemRandom;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let att_pub = kp.public_key().as_ref();
+        let cert = make_fake_p256_cert(att_pub);
+
+        let cred_pub = kp.public_key().as_ref();
+        let pk = PublicKey::ES256 {
+            x: cred_pub[1..33].to_vec(),
+            y: cred_pub[33..65].to_vec(),
+        };
+        let pub_area = build_tpm_ecc_pub_area(&cred_pub[1..33], &cred_pub[33..65]);
+        let name = compute_pub_area_name(&pub_area).unwrap();
+
+        // Build certInfo with WRONG magic (0xDEADBEEF).
+        let mut attest = Vec::new();
+        attest.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // wrong magic
+        attest.extend_from_slice(&[0x80, 0x17]);
+        attest.extend_from_slice(&[0x00, 0x00]); // qualifiedSigner (empty)
+        attest.extend_from_slice(&(32u16).to_be_bytes());
+        attest.extend_from_slice(&[0u8; 32]); // extraData placeholder
+        attest.extend_from_slice(&[0u8; 16]); // clockInfo + firmwareVersion
+        attest.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        attest.extend_from_slice(&name);
+        let mut cert_info = (attest.len() as u16).to_be_bytes().to_vec();
+        cert_info.extend_from_slice(&attest);
+
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(cert)]),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (Value::Text("certInfo".to_string()), Value::Bytes(cert_info)),
+            (Value::Text("pubArea".to_string()), Value::Bytes(pub_area)),
+        ]);
+
+        let result = verify("tpm", &stmt, &[], &[0u8; 32], &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("magic"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_bad_type_in_cert_info() {
+        use ring::rand::SystemRandom;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let att_pub = kp.public_key().as_ref();
+        let cert = make_fake_p256_cert(att_pub);
+
+        let cred_pub = kp.public_key().as_ref();
+        let pk = PublicKey::ES256 {
+            x: cred_pub[1..33].to_vec(),
+            y: cred_pub[33..65].to_vec(),
+        };
+        let pub_area = build_tpm_ecc_pub_area(&cred_pub[1..33], &cred_pub[33..65]);
+        let name = compute_pub_area_name(&pub_area).unwrap();
+
+        // Build certInfo with correct magic but wrong type (0x8001 instead of 0x8017).
+        let mut attest = Vec::new();
+        attest.extend_from_slice(&[0xFF, 0x54, 0x43, 0x47]); // magic OK
+        attest.extend_from_slice(&[0x80, 0x01]); // wrong type
+        attest.extend_from_slice(&[0x00, 0x00]);
+        attest.extend_from_slice(&(32u16).to_be_bytes());
+        attest.extend_from_slice(&[0u8; 32]);
+        attest.extend_from_slice(&[0u8; 16]);
+        attest.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        attest.extend_from_slice(&name);
+        let mut cert_info = (attest.len() as u16).to_be_bytes().to_vec();
+        cert_info.extend_from_slice(&attest);
+
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(cert)]),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (Value::Text("certInfo".to_string()), Value::Bytes(cert_info)),
+            (Value::Text("pubArea".to_string()), Value::Bytes(pub_area)),
+        ]);
+
+        let result = verify("tpm", &stmt, &[], &[0u8; 32], &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("type"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_extra_data_mismatch() {
+        use ring::rand::SystemRandom;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let att_pub = kp.public_key().as_ref();
+        let cert = make_fake_p256_cert(att_pub);
+
+        let cred_pub = kp.public_key().as_ref();
+        let pk = PublicKey::ES256 {
+            x: cred_pub[1..33].to_vec(),
+            y: cred_pub[33..65].to_vec(),
+        };
+        let pub_area = build_tpm_ecc_pub_area(&cred_pub[1..33], &cred_pub[33..65]);
+        let name = compute_pub_area_name(&pub_area).unwrap();
+
+        // Build certInfo with correct magic+type but wrong extraData (all zeros).
+        let cert_info = build_tpm_cert_info(&[0u8; 32], &name);
+
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(cert)]),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (Value::Text("certInfo".to_string()), Value::Bytes(cert_info)),
+            (Value::Text("pubArea".to_string()), Value::Bytes(pub_area)),
+        ]);
+
+        // auth_data = [0xAA; 10] so SHA-256(auth_data || client_data_hash) != all-zeros.
+        let result = verify("tpm", &stmt, &[0xAAu8; 10], &[0xBBu8; 32], &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("extraData"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_attested_name_mismatch() {
+        use ring::rand::SystemRandom;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let att_pub = kp.public_key().as_ref();
+        let cert = make_fake_p256_cert(att_pub);
+
+        let cred_pub = kp.public_key().as_ref();
+        let pk = PublicKey::ES256 {
+            x: cred_pub[1..33].to_vec(),
+            y: cred_pub[33..65].to_vec(),
+        };
+        let pub_area = build_tpm_ecc_pub_area(&cred_pub[1..33], &cred_pub[33..65]);
+
+        let auth_data = b"auth-data";
+        let client_data_hash = [0xCCu8; 32];
+        let mut att_signed = auth_data.to_vec();
+        att_signed.extend_from_slice(&client_data_hash);
+        let extra_data = crate::crypto::sha256(&att_signed);
+
+        // Use a wrong name (all zeros) so the check in step 4.d fails.
+        let wrong_name = vec![0u8; 34];
+        let cert_info = build_tpm_cert_info(&extra_data, &wrong_name);
+
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(cert)]),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (Value::Text("certInfo".to_string()), Value::Bytes(cert_info)),
+            (Value::Text("pubArea".to_string()), Value::Bytes(pub_area)),
+        ]);
+
+        let result = verify("tpm", &stmt, auth_data, &client_data_hash, &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("attested.name"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_pub_area_key_mismatch() {
+        use ring::rand::SystemRandom;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let att_pub = kp.public_key().as_ref();
+        let cert = make_fake_p256_cert(att_pub);
+
+        // pubArea contains a different key (all zeros) than the credential key.
+        let pub_area = build_tpm_ecc_pub_area(&[0u8; 32], &[0u8; 32]);
+        let name = compute_pub_area_name(&pub_area).unwrap();
+
+        let auth_data = b"auth-data";
+        let client_data_hash = [0xCCu8; 32];
+        let mut att_signed = auth_data.to_vec();
+        att_signed.extend_from_slice(&client_data_hash);
+        let extra_data = crate::crypto::sha256(&att_signed);
+        let cert_info = build_tpm_cert_info(&extra_data, &name);
+
+        // Credential key uses a non-zero x, y — mismatch with pubArea zeros.
+        let cred_pub = kp.public_key().as_ref();
+        let pk = PublicKey::ES256 {
+            x: cred_pub[1..33].to_vec(),
+            y: cred_pub[33..65].to_vec(),
+        };
+
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(cert)]),
+            ),
+            (Value::Text("sig".to_string()), Value::Bytes(vec![0u8; 64])),
+            (Value::Text("certInfo".to_string()), Value::Bytes(cert_info)),
+            (Value::Text("pubArea".to_string()), Value::Bytes(pub_area)),
+        ]);
+
+        let result = verify("tpm", &stmt, auth_data, &client_data_hash, &pk, &[]);
+        assert!(
+            matches!(result, Err(WebAuthnError::InvalidAttestationObject(ref m)) if m.contains("ES256"))
+        );
+    }
+
+    #[test]
+    fn tpm_rejects_bad_signature() {
+        use ring::rand::SystemRandom;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let att_pub = kp.public_key().as_ref();
+        let cert = make_fake_p256_cert(att_pub);
+
+        let cred_pub = kp.public_key().as_ref();
+        let pk = PublicKey::ES256 {
+            x: cred_pub[1..33].to_vec(),
+            y: cred_pub[33..65].to_vec(),
+        };
+        let pub_area = build_tpm_ecc_pub_area(&cred_pub[1..33], &cred_pub[33..65]);
+        let name = compute_pub_area_name(&pub_area).unwrap();
+
+        let auth_data = b"auth-data";
+        let client_data_hash = [0xCCu8; 32];
+        let mut att_signed = auth_data.to_vec();
+        att_signed.extend_from_slice(&client_data_hash);
+        let extra_data = crate::crypto::sha256(&att_signed);
+        let cert_info = build_tpm_cert_info(&extra_data, &name);
+
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(cert)]),
+            ),
+            (
+                Value::Text("sig".to_string()),
+                Value::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            ), // garbage
+            (Value::Text("certInfo".to_string()), Value::Bytes(cert_info)),
+            (Value::Text("pubArea".to_string()), Value::Bytes(pub_area)),
+        ]);
+
+        let result = verify("tpm", &stmt, auth_data, &client_data_hash, &pk, &[]);
+        assert!(matches!(
+            result,
+            Err(WebAuthnError::SignatureVerificationFailed)
+        ));
+    }
+
+    #[test]
+    fn tpm_valid_es256_returns_basic() {
+        use ring::rand::SystemRandom;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        let rng = SystemRandom::new();
+
+        // Attestation keypair (signs certInfo).
+        let att_pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let att_kp =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, att_pkcs8.as_ref(), &rng)
+                .unwrap();
+        let att_pub = att_kp.public_key().as_ref();
+        let cert = make_fake_p256_cert(att_pub);
+
+        // Credential keypair (what gets attested — can differ from the AIK cert key).
+        let cred_pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let cred_kp =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, cred_pkcs8.as_ref(), &rng)
+                .unwrap();
+        let cred_pub = cred_kp.public_key().as_ref(); // 65 bytes: 0x04 || x || y
+        let cred_x = cred_pub[1..33].to_vec();
+        let cred_y = cred_pub[33..65].to_vec();
+        let credential_public_key = PublicKey::ES256 {
+            x: cred_x.clone(),
+            y: cred_y.clone(),
+        };
+
+        let auth_data = b"fake-auth-data";
+        let client_data_hash = [0xABu8; 32];
+
+        // Build pubArea for the ES256 credential key.
+        let pub_area = build_tpm_ecc_pub_area(&cred_x, &cred_y);
+
+        // Compute the TPM name of pubArea: SHA-256 nameAlg → [0x00, 0x0B] || SHA-256(pubArea).
+        let name = compute_pub_area_name(&pub_area).unwrap();
+
+        // Compute extraData = SHA-256(authData || clientDataHash).
+        let mut att_signed = auth_data.to_vec();
+        att_signed.extend_from_slice(&client_data_hash);
+        let extra_data = crate::crypto::sha256(&att_signed);
+
+        // Build a valid certInfo (TPM2B_ATTEST).
+        let cert_info = build_tpm_cert_info(&extra_data, &name);
+
+        // Sign certInfo with the attestation key (not the credential key).
+        let sig = att_kp.sign(&rng, &cert_info).unwrap();
+
+        let stmt = Value::Map(vec![
+            (
+                Value::Text("ver".to_string()),
+                Value::Text("2.0".to_string()),
+            ),
+            (
+                Value::Text("alg".to_string()),
+                Value::Integer((-7i64).into()),
+            ),
+            (
+                Value::Text("x5c".to_string()),
+                Value::Array(vec![Value::Bytes(cert)]),
+            ),
+            (
+                Value::Text("sig".to_string()),
+                Value::Bytes(sig.as_ref().to_vec()),
+            ),
+            (Value::Text("certInfo".to_string()), Value::Bytes(cert_info)),
+            (Value::Text("pubArea".to_string()), Value::Bytes(pub_area)),
+        ]);
+
+        let result = verify(
+            "tpm",
             &stmt,
             auth_data,
             &client_data_hash,
