@@ -9,6 +9,62 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.6.0] — 2026-07-01
+
+### Added
+
+- **TPM attestation** (`"tpm"`, W3C WebAuthn §8.3) — full TPM 2.0 certify
+  attestation verification. `ver` must be `"2.0"`, `alg` must match the
+  credential key algorithm, and `x5c` must be present (ECDAA is not supported).
+  `certInfo` (TPM2B_ATTEST) is parsed and validated: magic `0xFF544347`, type
+  `0x8017`, `extraData` must equal `SHA-256(authData || clientDataHash)`, and
+  `attested.name` must equal `nameAlg_bytes || H_nameAlg(pubArea)`. `pubArea`
+  (TPMT_PUBLIC) is parsed for ECC (`0x0023`) and RSA (`0x0001`) key types; the
+  unique field is compared against the stored credential key. `sig` is verified
+  over the raw `certInfo` bytes using the AIK certificate's public key.
+  `nameAlg` supports SHA-256 (`0x000B`) and SHA-384 (`0x000C`). Returns
+  `AttestationType::Basic`.
+
+- **Authenticator extension map** (W3C WebAuthn §6.1 / §10.5) — when the ED
+  flag (bit 7) is set in `authenticatorData`, the trailing CBOR extension map
+  is now decoded and stored as `extensions: Option<HashMap<String,
+  ciborium::Value>>` on `AuthenticatorData`. `parse_extension_map` decodes the
+  CBOR; `parse_attested_credential_data` now returns `(AttestedCredentialData,
+  usize)` so the caller can locate extension bytes that follow the COSE key
+  without a second parse path.
+
+- **Extension data in result types** — `RegistrationResult` and
+  `AuthenticationResult` now expose `extensions: Option<HashMap<String,
+  ciborium::Value>>` forwarded directly from `AuthenticatorData`. Callers can
+  inspect authenticator extension data (e.g. `credProps`, `appid`) after a
+  successful ceremony. The field is excluded from `serde` serialization because
+  `ciborium::Value` has no portable JSON representation.
+
+- **`x5c` certificate chain verification** — the `x5c` array in `"packed"`,
+  `"fido-u2f"`, `"android-key"`, `"apple"`, and `"tpm"` attestation formats is
+  now verified for correct chain order: each certificate must be signed by the
+  next entry in the array (§7.1 step 22). New dependency: `x509-parser 0.16`
+  (with the `verify` feature). New dev-dependency: `rcgen 0.13` (used in chain
+  verification tests).
+
+- **`RelyingParty::trust_anchors`** — new builder method that accepts a list
+  of DER-encoded root CA certificates. When configured, the chain root is
+  checked against the anchor set after order verification. A chain whose root
+  matches a trust anchor returns `AttestationType::BasicVerified`; one that
+  does not returns `AttestationType::Basic`.
+
+- **`AttestationType::BasicVerified`** — new variant on `AttestationType`
+  (`credential.rs`) indicating that the attestation certificate chain was
+  verified all the way to a configured trust anchor.
+
+- **`WebAuthnError::AttestationChainInvalid`** — returned when `x5c` chain
+  order verification fails (a certificate is not signed by the next entry).
+
+- **`WebAuthnError::AttestationRootUntrusted`** — returned when trust anchors
+  are configured and the chain root does not match any of them.
+
+---
+
 ## [0.5.0] — 2026-06-28
 
 ### Added
@@ -163,6 +219,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **End-to-end demo** — `examples/demo.rs` exercises ES256 + RS256 registration, authentication,
   and replay attack rejection entirely in software
 
+[0.6.0]: https://github.com/ivanxie/caden-rs/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ivanxie/caden-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ivanxie/caden-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ivanxie/caden-rs/compare/v0.2.0...v0.3.0
